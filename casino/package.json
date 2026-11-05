@@ -1,0 +1,20 @@
+{
+  "name": "neon-vault-casino",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Provably fair casino with accounts, six server-authoritative games and Stripe Checkout deposits.",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.3",
+    "stripe": "^23.1.0"
+  }
+}
