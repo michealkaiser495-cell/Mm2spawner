@@ -1,3 +1,6 @@
+import { sfx } from './sfx.js';
+
+export { sfx };
 export const state = { user: null, config: null, stats: null };
 
 const listeners = new Set();
@@ -55,7 +58,7 @@ export function h(tag, attrs = {}, ...children) {
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === null || v === undefined || v === false) continue;
     if (k === 'class') el.className = v;
-    else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k === 'style' && typeof v === 'object') for (const [p, val] of Object.entries(v)) { if (p.startsWith('--')) el.style.setProperty(p, val); else el.style[p] = val; }
     else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
     else if (k === 'html') el.innerHTML = v;
     else el.setAttribute(k, v === true ? '' : v);
@@ -150,3 +153,32 @@ export function setupCanvas(canvas, width, height) {
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export function bigWin(multiplier, amount) {
+  sfx.bigWin();
+  const colors = ['#21f3a3', '#8b5cf6', '#ffb547', '#ff4d6d', '#5ad8ff'];
+  const confetti = Array.from({ length: 70 }, (_, i) => h('i', {
+    style: {
+      left: `${Math.random() * 100}%`,
+      background: colors[i % colors.length],
+      animationDelay: `${Math.random() * 0.4}s`,
+      animationDuration: `${1.6 + Math.random() * 1.2}s`,
+      transform: `rotate(${Math.random() * 360}deg)`,
+    },
+  }));
+  const el = h('div', { class: 'bigwin', role: 'status' },
+    h('div', { class: 'confetti' }, confetti),
+    h('div', { class: 'bigwin-card' }, h('div', { class: 'bigwin-k' }, multiplier >= 50 ? 'MEGA WIN' : 'BIG WIN'), h('div', { class: 'bigwin-m' }, fmtMult(multiplier)), h('div', { class: 'bigwin-a' }, `+${money(amount)}`)),
+  );
+  el.addEventListener('click', () => el.remove());
+  document.body.append(el);
+  setTimeout(() => el.remove(), 3200);
+}
+
+export function celebrate(result) {
+  if (!result || !result.wager) return;
+  const m = result.payout / result.wager;
+  if (m >= 10) bigWin(m, result.payout);
+  else if (result.payout > result.wager) sfx.win();
+  else if (result.payout === 0) sfx.lose();
+}

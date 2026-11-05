@@ -4,6 +4,7 @@ const { rateLimit } = require('express-rate-limit');
 const { AppError, bad } = require('./errors');
 const { makeAuth, publicUser } = require('./auth');
 const { makePayments } = require('./payments');
+const { makeWithdrawals, METHODS } = require('./withdrawals');
 const { newServerSeed, sha256 } = require('./fair');
 const { verify } = require('./verify');
 const { MIN_BET, MAX_BET } = require('./games/common');
@@ -13,6 +14,7 @@ const roulette = require('./games/roulette');
 const crash = require('./games/crash');
 const mines = require('./games/mines');
 const blackjack = require('./games/blackjack');
+const crates = require('./games/crates');
 
 function limiter(config, windowMs, limit) {
   if (!config.rateLimit) return (_req, _res, next) => next();
@@ -23,6 +25,7 @@ function createApp({ db, config, stripe = null }) {
   const app = express();
   const auth = makeAuth(db, config);
   const payments = makePayments(db, config, stripe);
+  const withdrawals = makeWithdrawals(db, config);
 
   app.disable('x-powered-by');
   if (config.trustProxy) app.set('trust proxy', 1);
@@ -78,6 +81,9 @@ function createApp({ db, config, stripe = null }) {
       dailyDepositLimit: config.dailyDepositLimit,
       signupBonus: config.signupBonus,
       currency: config.currency,
+      minWithdraw: config.minWithdraw,
+      discordContact: config.discordContact,
+      withdrawMethods: METHODS,
     });
   });
 
@@ -88,7 +94,7 @@ function createApp({ db, config, stripe = null }) {
     const stats = db.prepare(
       'SELECT COUNT(*) AS bets, COALESCE(SUM(wager), 0) AS wagered, COALESCE(SUM(payout), 0) AS paidOut FROM bets WHERE user_id = ?'
     ).get(req.user.id);
-    res.json({ user: publicUser(req.user), stats });
+    res.json({ user: publicUser(req.user, config), stats });
   });
 
   user.get('/bets', (req, res) => {
@@ -122,6 +128,33 @@ function createApp({ db, config, stripe = null }) {
   user.post('/wallet/deposit', limiter(config, 60_000, 10), async (req, res) => {
     res.json(await payments.createDeposit(req.user, req.body?.amount));
   });
+
+  user.get('/wallet/withdrawals', (req, res) => {
+    res.json({ withdrawals: withdrawals.list(req.user.id), eligibility: withdrawals.eligibility(req.user.id), contact: config.discordContact });
+  });
+
+  user.post('/wallet/withdraw', limiter(config, 60_000, 5), (req, res) => {
+    res.json(withdrawals.request(req.user, req.body || {}));
+  });
+
+  user.post('/wallet/withdrawals/:id/cancel', (req, res) => {
+    res.json(withdrawals.cancel(req.user.id, Number(req.params.id)));
+  });
+
+  user.get('/feed', (_req, res) => {
+    const rows = db.prepare(
+      `SELECT b.id, b.game, b.wager, b.payout, b.multiplier, b.created_at, u.username
+       FROM bets b JOIN users u ON u.id = b.user_id WHERE b.multiplier >= 2 ORDER BY b.id DESC LIMIT 15`
+    ).all();
+    res.json({
+      wins: rows.map((r) => ({
+        id: r.id, game: r.game, wager: r.wager, payout: r.payout, multiplier: r.multiplier, createdAt: r.created_at,
+        player: r.username.length <= 3 ? `${r.username[0]}**` : `${r.username.slice(0, 2)}${'*'.repeat(Math.min(5, r.username.length - 2))}`,
+      })),
+    });
+  });
+
+  user.get('/crates', (_req, res) => res.json({ crates: crates.catalog() }));
 
   user.get('/fair', (req, res) => {
     const u = req.user;
@@ -166,6 +199,21 @@ function createApp({ db, config, stripe = null }) {
   user.post('/games/blackjack/start', gameLimiter, play(blackjack.start));
   user.post('/games/blackjack/action', gameLimiter, play(blackjack.action));
   user.get('/games/blackjack/state', play(blackjack.status));
+  user.post('/games/crates/open', gameLimiter, play(crates.open));
+
+  const admin = express.Router();
+  admin.use(auth.requireAdmin);
+  admin.get('/overview', (_req, res) => res.json(withdrawals.overview()));
+  admin.get('/withdrawals', (req, res) => {
+    const status = ['pending', 'paid', 'rejected', 'cancelled'].includes(req.query.status) ? req.query.status : null;
+    res.json({ withdrawals: withdrawals.adminList(status) });
+  });
+  admin.post('/withdrawals/:id/:action', (req, res) => {
+    const action = req.params.action === 'pay' ? 'paid' : req.params.action === 'reject' ? 'rejected' : null;
+    if (!action) throw bad('Unknown action');
+    res.json({ withdrawal: withdrawals.resolve(req.user.id, Number(req.params.id), action, req.body?.note) });
+  });
+  user.use('/admin', admin);
 
   app.use('/api', user);
   app.use('/api', (_req, _res, next) => next(new AppError(404, 'Not found')));

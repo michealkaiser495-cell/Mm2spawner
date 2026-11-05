@@ -1,4 +1,4 @@
-import { api, h, money, fmtMult, betControl, stat, gameShell, setBalance, toastError } from '../core.js';
+import { api, h, money, fmtMult, betControl, stat, gameShell, setBalance, toastError, celebrate, sfx } from '../core.js';
 
 export function mountMines(view) {
   const { root, panel, stage } = gameShell('Mines', 'Reveal gems for a bigger multiplier. Hit a mine and it is over.');
@@ -78,8 +78,14 @@ export function mountMines(view) {
     busy = true;
     try {
       const r = await api('/games/mines/reveal', { method: 'POST', body: { tile } });
-      if (r.active) renderActive(r);
-      else renderEnd(r);
+      if (r.active) {
+        sfx.gem();
+        renderActive(r);
+      } else {
+        renderEnd(r);
+        if (r.hitMine) sfx.boom();
+        else celebrate(r);
+      }
     } catch (err) {
       toastError(err);
     } finally {
@@ -99,7 +105,9 @@ export function mountMines(view) {
     button.disabled = true;
     try {
       if (game) {
-        renderEnd(await api('/games/mines/cashout', { method: 'POST' }));
+        const r = await api('/games/mines/cashout', { method: 'POST' });
+        renderEnd(r);
+        celebrate(r);
       } else {
         const wager = bet.validate();
         resetTiles();

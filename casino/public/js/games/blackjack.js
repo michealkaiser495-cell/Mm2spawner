@@ -1,4 +1,4 @@
-import { api, h, money, betControl, gameShell, setBalance, toastError } from '../core.js';
+import { api, h, money, betControl, gameShell, setBalance, toastError, celebrate, sfx } from '../core.js';
 
 const SUIT = { S: '♠', H: '♥', D: '♦', C: '♣' };
 const OUTCOME = { blackjack: 'Blackjack!', win: 'Win', push: 'Push', lose: 'Lose', bust: 'Bust' };
@@ -80,7 +80,10 @@ export function mountBlackjack(view) {
     if (busy) return;
     busy = true;
     try {
-      render(await api(path, { method: 'POST', body }));
+      const r = await api(path, { method: 'POST', body });
+      sfx.card();
+      render(r);
+      if (!r.active) setTimeout(() => celebrate(r), 250);
     } catch (err) {
       toastError(err);
     } finally {

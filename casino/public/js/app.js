@@ -1,4 +1,5 @@
-import { state, api, h, money, onBalance, toastError } from './core.js';
+import { state, api, h, money, onBalance, toastError, sfx } from './core.js';
+import { renderAdmin } from './pages/admin.js';
 import { renderAuth } from './pages/auth.js';
 import { renderLobby } from './pages/lobby.js';
 import { renderWallet } from './pages/wallet.js';
@@ -19,9 +20,17 @@ function renderChrome() {
     return;
   }
   const links = [['#/', 'Lobby'], ...GAMES.map((g) => [`#/game/${g.id}`, g.name]), ['#/history', 'History'], ['#/wallet', 'Wallet']];
+  if (state.user.isAdmin) links.push(['#/admin', 'Admin']);
   for (const [href, label] of links) nav.append(h('a', { href, 'data-href': href }, label));
   const amount = h('span', { id: 'balance' }, money(state.user.balance));
+  shown = state.user.balance;
+  const mute = h('button', { class: 'btn btn-ghost btn-sm', title: 'Toggle sound', 'aria-label': 'Toggle sound' }, sfx.isMuted() ? '🔇' : '🔊');
+  mute.addEventListener('click', () => {
+    sfx.setMuted(!sfx.isMuted());
+    mute.textContent = sfx.isMuted() ? '🔇' : '🔊';
+  });
   account.append(
+    mute,
     h('div', { class: 'balance-pill' }, amount, h('a', { class: 'btn btn-primary', href: '#/wallet' }, 'Deposit')),
     h('button', {
       class: 'btn btn-ghost btn-sm',
@@ -45,13 +54,26 @@ function highlightNav() {
   nav.querySelectorAll('a').forEach((a) => a.classList.toggle('active', a.dataset.href === current));
 }
 
+let shown = null;
+let tween = 0;
 onBalance((cents) => {
   const el = document.getElementById('balance');
   if (!el) return;
-  el.textContent = money(cents);
-  el.classList.remove('balance-flash');
-  void el.offsetWidth;
-  el.classList.add('balance-flash');
+  cancelAnimationFrame(tween);
+  const from = shown ?? cents;
+  const t0 = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - t0) / 450);
+    shown = Math.round(from + (cents - from) * (1 - (1 - p) ** 3));
+    el.textContent = money(shown);
+    if (p < 1) tween = requestAnimationFrame(step);
+  };
+  tween = requestAnimationFrame(step);
+  if (cents > from) {
+    el.classList.remove('balance-flash');
+    void el.offsetWidth;
+    el.classList.add('balance-flash');
+  }
 });
 
 function parseHash() {
@@ -98,6 +120,8 @@ async function route() {
     mount(renderWallet(view, params));
   } else if (section === 'fair') {
     mount(renderFair(view));
+  } else if (section === 'admin' && state.user.isAdmin) {
+    mount(renderAdmin(view));
   } else if (section === 'history') {
     mount(renderHistory(view));
   } else if (section === 'game' && GAMES.some((g) => g.id === sub)) {

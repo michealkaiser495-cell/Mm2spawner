@@ -55,6 +55,21 @@ CREATE TABLE IF NOT EXISTS bets (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_bets_user ON bets(user_id, id DESC);
+CREATE TABLE IF NOT EXISTS withdrawals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  amount INTEGER NOT NULL CHECK (amount > 0),
+  method TEXT NOT NULL,
+  details TEXT NOT NULL,
+  discord TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  admin_note TEXT,
+  created_at INTEGER NOT NULL,
+  resolved_at INTEGER,
+  resolved_by INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_wd_user ON withdrawals(user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_wd_status ON withdrawals(status, id DESC);
 CREATE TABLE IF NOT EXISTS active_games (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   game TEXT NOT NULL,

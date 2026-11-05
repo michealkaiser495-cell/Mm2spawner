@@ -1,9 +1,15 @@
-import { state, api, h, money, toCents, fmtTime, setBalance, toast } from '../core.js';
+import { state, api, h, money, toCents, fmtTime, setBalance, toast, toastError } from '../core.js';
 
-const TX_LABELS = { deposit: 'Deposit', bet: 'Bet', win: 'Win', bonus: 'Bonus' };
+const TX_LABELS = { deposit: 'Deposit', bet: 'Bet', win: 'Win', bonus: 'Bonus', withdrawal: 'Withdrawal', withdrawal_refund: 'Withdrawal refund' };
+const METHOD_LABELS = { paypal: 'PayPal', cashapp: 'Cash App', crypto: 'Crypto', other: 'Other' };
+
+function table(headers, rows) {
+  return h('table', {}, h('thead', {}, h('tr', {}, headers.map((x) => h('th', {}, x)))), h('tbody', {}, rows));
+}
 
 export function renderWallet(view, params) {
   const cfg = state.config;
+  const contact = cfg.discordContact;
   const notices = {
     success: ['ok', 'Payment received. Your balance has been topped up.'],
     pending: ['warn', 'Payment is processing. Your balance updates as soon as Stripe confirms it.'],
@@ -20,14 +26,14 @@ export function renderWallet(view, params) {
   const err = h('div', { class: 'form-error' });
   const go = h('button', { class: 'btn btn-primary btn-block', type: 'submit', disabled: !cfg.depositsEnabled }, 'Continue to secure checkout');
 
-  const form = h('form', {},
+  const depositForm = h('form', {},
     h('div', { class: 'preset-row' }, presetButtons),
     h('div', { class: 'field' }, h('label', {}, 'Amount (USD)'), amount),
     err, go,
     h('p', { class: 'muted', style: { fontSize: '13px', marginBottom: 0 } },
       `Min ${money(cfg.minDeposit)} · Max ${money(cfg.maxDeposit)} per deposit · ${money(cfg.dailyDepositLimit)} per 24 hours. Payments are processed by Stripe; card details never touch our servers.`),
   );
-  form.addEventListener('submit', async (e) => {
+  depositForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     err.textContent = '';
     const cents = toCents(amount.value);
@@ -47,7 +53,50 @@ export function renderWallet(view, params) {
     }
   });
 
+  const wAmount = h('input', { type: 'number', min: cfg.minWithdraw / 100, step: '0.01', inputmode: 'decimal', placeholder: `Min ${money(cfg.minWithdraw)}` });
+  const wMethod = h('select', {}, cfg.withdrawMethods.map((m) => h('option', { value: m }, METHOD_LABELS[m] || m)));
+  const wDetails = h('input', { type: 'text', maxlength: 200, placeholder: 'PayPal email, $cashtag, wallet address…' });
+  const wDiscord = h('input', { type: 'text', maxlength: 33, placeholder: 'your_discord_name', autocomplete: 'off' });
+  const wErr = h('div', { class: 'form-error' });
+  const wGo = h('button', { class: 'btn btn-primary btn-block', type: 'submit' }, 'Request withdrawal');
+  const eligibilityEl = h('div');
+  const withdrawForm = h('form', {},
+    h('div', { class: 'notice warn', style: { marginBottom: '14px' } },
+      'Withdrawals are paid out manually. After you submit, DM ', h('strong', {}, contact), ' on Discord with your request ID to get paid.'),
+    eligibilityEl,
+    h('div', { class: 'two-col', style: { gap: '12px' } },
+      h('div', { class: 'field' }, h('label', {}, 'Amount (USD)'), h('div', { class: 'input-group' }, wAmount, h('button', { type: 'button', class: 'btn btn-sm', onclick: () => { wAmount.value = (state.user.balance / 100).toFixed(2); } }, 'Max'))),
+      h('div', { class: 'field' }, h('label', {}, 'Payout method'), wMethod),
+    ),
+    h('div', { class: 'field' }, h('label', {}, 'Payout details'), wDetails),
+    h('div', { class: 'field' }, h('label', {}, 'Your Discord username'), wDiscord),
+    wErr, wGo,
+  );
+  withdrawForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    wErr.textContent = '';
+    const cents = toCents(wAmount.value);
+    if (!Number.isFinite(cents) || cents < cfg.minWithdraw) return (wErr.textContent = `Minimum withdrawal is ${money(cfg.minWithdraw)}.`);
+    if (cents > state.user.balance) return (wErr.textContent = 'You cannot withdraw more than your balance.');
+    wGo.disabled = true;
+    try {
+      const r = await api('/wallet/withdraw', {
+        method: 'POST',
+        body: { amount: cents, method: wMethod.value, details: wDetails.value, discord: wDiscord.value },
+      });
+      setBalance(r.balance);
+      toast(`Request #W${r.withdrawal.id} submitted. DM ${r.contact} on Discord to get paid.`, 'ok');
+      wAmount.value = '';
+      load();
+    } catch (ex) {
+      wErr.textContent = ex.message;
+    } finally {
+      wGo.disabled = false;
+    }
+  });
+
   const deposits = h('div', { class: 'table-wrap' }, h('div', { class: 'spinner' }));
+  const withdrawals = h('div', { class: 'table-wrap' }, h('div', { class: 'spinner' }));
   const txs = h('div', { class: 'table-wrap' }, h('div', { class: 'spinner' }));
   const balanceEl = h('div', { class: 'mono', style: { fontSize: '38px', fontWeight: 800 } }, money(state.user.balance));
 
@@ -56,34 +105,74 @@ export function renderWallet(view, params) {
     flag && notices[flag] ? h('div', { class: `notice ${notices[flag][0]}` }, notices[flag][1]) : null,
     cfg.depositsEnabled ? null : h('div', { class: 'notice warn' }, 'Deposits are disabled: the server has no STRIPE_SECRET_KEY configured.'),
     h('div', { class: 'two-col' },
-      h('section', { class: 'card' }, h('h2', {}, 'Deposit'), form),
+      h('section', { class: 'card' }, h('h2', {}, 'Deposit'), depositForm),
       h('section', { class: 'card' },
         h('h2', {}, 'Balance'), balanceEl,
-        h('p', { class: 'muted' }, 'Play credit is for entertainment on this site only.'),
         h('h3', { style: { marginTop: '20px' } }, 'Recent deposits'), deposits,
       ),
+    ),
+    h('div', { class: 'two-col', style: { marginTop: '18px' } },
+      h('section', { class: 'card' }, h('h2', {}, 'Withdraw'), withdrawForm),
+      h('section', { class: 'card' }, h('h2', {}, 'Your withdrawals'), withdrawals),
     ),
     h('section', { class: 'card', style: { marginTop: '18px' } }, h('h2', {}, 'Transactions'), txs),
   ].filter(Boolean));
 
+  function renderEligibility(e) {
+    if (!e.hasDeposit) {
+      eligibilityEl.replaceChildren(h('p', { class: 'muted', style: { fontSize: '13px' } }, 'You need at least one deposit before you can withdraw. Bonus credit is play-only.'));
+    } else if (e.wagerRequired > 0) {
+      const pct = Math.min(100, Math.round((e.wagered / e.deposited) * 100));
+      eligibilityEl.replaceChildren(h('div', { class: 'field' },
+        h('label', {}, `Wagering: ${money(e.wagered)} of ${money(e.deposited)} (${money(e.wagerRequired)} to go)`),
+        h('div', { class: 'progress' }, h('div', { style: { width: `${pct}%` } }))));
+    } else {
+      eligibilityEl.replaceChildren();
+    }
+    const blocked = !e.hasDeposit || e.wagerRequired > 0 || e.pending;
+    wGo.disabled = blocked;
+    wGo.textContent = e.pending ? 'You have a pending request' : 'Request withdrawal';
+  }
+
   async function load() {
     try {
-      const [me, d, t] = await Promise.all([api('/me'), api('/wallet/deposits'), api('/transactions')]);
+      const [me, d, w, t] = await Promise.all([api('/me'), api('/wallet/deposits'), api('/wallet/withdrawals'), api('/transactions')]);
       setBalance(me.user.balance);
       balanceEl.textContent = money(me.user.balance);
+      renderEligibility(w.eligibility);
       deposits.replaceChildren(d.deposits.length
-        ? h('table', {}, h('thead', {}, h('tr', {}, ['Date', 'Amount', 'Status'].map((x) => h('th', {}, x)))),
-          h('tbody', {}, d.deposits.map((r) => h('tr', {}, h('td', { class: 'muted' }, fmtTime(r.createdAt)), h('td', { class: 'mono' }, money(r.amount)), h('td', {}, h('span', { class: `status ${r.status}` }, r.status))))))
+        ? table(['Date', 'Amount', 'Status'], d.deposits.map((r) => h('tr', {}, h('td', { class: 'muted' }, fmtTime(r.createdAt)), h('td', { class: 'mono' }, money(r.amount)), h('td', {}, h('span', { class: `status ${r.status}` }, r.status)))))
         : h('p', { class: 'muted' }, 'No deposits yet.'));
+      withdrawals.replaceChildren(w.withdrawals.length
+        ? table(['ID', 'Date', 'Amount', 'Method', 'Status', ''], w.withdrawals.map((r) => h('tr', {},
+          h('td', { class: 'mono' }, `#W${r.id}`),
+          h('td', { class: 'muted' }, fmtTime(r.createdAt)),
+          h('td', { class: 'mono' }, money(r.amount)),
+          h('td', {}, METHOD_LABELS[r.method] || r.method),
+          h('td', {}, h('span', { class: `status ${r.status}` }, r.status), r.adminNote ? h('div', { class: 'muted', style: { fontSize: '12px', whiteSpace: 'normal' } }, r.adminNote) : null),
+          h('td', {}, r.status === 'pending' ? h('button', {
+            class: 'btn btn-ghost btn-sm',
+            onclick: async () => {
+              try {
+                const res = await api(`/wallet/withdrawals/${r.id}/cancel`, { method: 'POST' });
+                setBalance(res.balance);
+                toast('Withdrawal cancelled and refunded', 'ok');
+                load();
+              } catch (ex) {
+                toastError(ex);
+              }
+            },
+          }, 'Cancel') : null),
+        )))
+        : h('p', { class: 'muted' }, `No withdrawals yet. Questions? DM ${contact} on Discord.`));
       txs.replaceChildren(t.transactions.length
-        ? h('table', {}, h('thead', {}, h('tr', {}, ['Date', 'Type', 'Game', 'Amount', 'Balance'].map((x) => h('th', {}, x)))),
-          h('tbody', {}, t.transactions.map((r) => h('tr', {},
-            h('td', { class: 'muted' }, fmtTime(r.createdAt)),
-            h('td', {}, TX_LABELS[r.type] || r.type),
-            h('td', { style: { textTransform: 'capitalize' } }, r.game || '—'),
-            h('td', { class: `mono ${r.amount >= 0 ? 'pos' : 'neg'}` }, `${r.amount >= 0 ? '+' : '−'}${money(Math.abs(r.amount))}`),
-            h('td', { class: 'mono' }, money(r.balanceAfter)),
-          ))))
+        ? table(['Date', 'Type', 'Game', 'Amount', 'Balance'], t.transactions.map((r) => h('tr', {},
+          h('td', { class: 'muted' }, fmtTime(r.createdAt)),
+          h('td', {}, TX_LABELS[r.type] || r.type),
+          h('td', { style: { textTransform: 'capitalize' } }, r.game || '—'),
+          h('td', { class: `mono ${r.amount >= 0 ? 'pos' : 'neg'}` }, `${r.amount >= 0 ? '+' : '−'}${money(Math.abs(r.amount))}`),
+          h('td', { class: 'mono' }, money(r.balanceAfter)),
+        )))
         : h('p', { class: 'muted' }, 'No transactions yet.'));
       return d.deposits;
     } catch (ex) {

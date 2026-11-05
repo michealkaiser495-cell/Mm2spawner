@@ -1,4 +1,4 @@
-import { api, h, money, fmtMult, betControl, stat, gameShell, setBalance, setupCanvas, toastError } from '../core.js';
+import { api, h, money, fmtMult, betControl, stat, gameShell, setBalance, setupCanvas, toastError, celebrate, sfx } from '../core.js';
 
 const GROWTH = 0.00006;
 const multAt = (ms) => Math.floor(100 * Math.exp(GROWTH * Math.max(0, ms))) / 100;
@@ -146,6 +146,8 @@ export function mountCrash(view) {
     auto.disabled = false;
     setBalance(r.balance);
     addChip(r.crashPoint, true);
+    if (r.cashedOutAt) celebrate(r);
+    else sfx.boom();
   }
 
   async function checkState() {
@@ -183,6 +185,7 @@ export function mountCrash(view) {
         if (a !== null && !(a >= 1.01)) throw new Error('Auto cash-out must be at least 1.01x');
         const r = await api('/games/crash/start', { method: 'POST', body: { wager: w, autoCashout: a } });
         setBalance(r.balance);
+        sfx.click();
         setRunning(r);
       }
     } catch (err) {

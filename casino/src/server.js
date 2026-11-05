@@ -25,8 +25,12 @@ const config = {
   secureCookies: (env.BASE_URL || '').startsWith('https://'),
   trustProxy: env.TRUST_PROXY === '1',
   rateLimit: env.DISABLE_RATE_LIMIT !== '1',
+  minWithdraw: int(env.MIN_WITHDRAW_CENTS, 1000),
+  discordContact: (env.DISCORD_CONTACT || 'wmz9').trim(),
+  admins: new Set((env.ADMIN_USERNAMES || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)),
 };
 
+if (config.admins.size === 0) console.warn('ADMIN_USERNAMES not set: nobody can approve withdrawals.');
 for (const [k, v] of Object.entries(config)) {
   if (typeof v === 'number' && (!Number.isInteger(v) || v < 0)) throw new Error(`Invalid numeric config for ${k}`);
 }

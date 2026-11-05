@@ -1,4 +1,4 @@
-import { state, api, h, money, gameShell, setBalance, setupCanvas, toastError } from '../core.js';
+import { state, api, h, money, gameShell, setBalance, setupCanvas, toastError, celebrate, sfx } from '../core.js';
 
 const ORDER = [0, 32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10, 5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26];
 const RED = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
@@ -55,6 +55,7 @@ export function mountRoulette(view) {
       const prev = bets.get(key);
       const next = (prev?.amount || 0) + chip;
       bets.set(key, { type, value, amount: next });
+      sfx.click();
       history.push({ key, amount: chip });
       renderChips();
     };
@@ -240,6 +241,7 @@ export function mountRoulette(view) {
       banner.className = `result-banner ${net > 0 ? 'win' : net < 0 ? 'lose' : ''}`;
       banner.textContent = r.payout > 0 ? `Won ${money(r.payout)} (${net >= 0 ? '+' : '−'}${money(Math.abs(net))})` : `No win · −${money(r.wager)}`;
       setBalance(r.balance);
+      celebrate(r);
     } catch (err) {
       toastError(err);
     } finally {

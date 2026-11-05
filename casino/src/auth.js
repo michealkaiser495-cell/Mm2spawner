@@ -60,8 +60,9 @@ function readCookie(req, name) {
   return null;
 }
 
-function publicUser(u) {
-  return { id: u.id, username: u.username, email: u.email, balance: u.balance, createdAt: u.created_at };
+function publicUser(u, config) {
+  const isAdmin = Boolean(config?.admins?.has(String(u.username).toLowerCase()));
+  return { id: u.id, username: u.username, email: u.email, balance: u.balance, createdAt: u.created_at, isAdmin };
 }
 
 function makeAuth(db, config) {
@@ -83,7 +84,7 @@ function makeAuth(db, config) {
       return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
     });
     setSessionCookie(res, createSession(db, user.id), config.secureCookies);
-    res.status(201).json({ user: publicUser(user) });
+    res.status(201).json({ user: publicUser(user, config) });
   }
 
   async function login(req, res) {
@@ -93,7 +94,7 @@ function makeAuth(db, config) {
     const ok = await verifyPassword(password, user ? user.password_hash : DUMMY_HASH);
     if (!user || !ok) throw new AppError(401, 'Invalid username/email or password');
     setSessionCookie(res, createSession(db, user.id), config.secureCookies);
-    res.json({ user: publicUser(user) });
+    res.json({ user: publicUser(user, config) });
   }
 
   function logout(req, res) {
@@ -119,7 +120,13 @@ function makeAuth(db, config) {
     next();
   }
 
-  return { signup, login, logout, loadUser, requireUser };
+  function requireAdmin(req, _res, next) {
+    if (!req.user) return next(new AppError(401, 'Please log in'));
+    if (!publicUser(req.user, config).isAdmin) return next(new AppError(403, 'Admins only'));
+    next();
+  }
+
+  return { signup, login, logout, loadUser, requireUser, requireAdmin };
 }
 
 module.exports = { makeAuth, publicUser, hashPassword, verifyPassword, COOKIE };

@@ -1,4 +1,4 @@
-import { api, h, money, fmtMult, betControl, seg, gameShell, setBalance, setupCanvas, toastError } from '../core.js';
+import { api, h, money, fmtMult, betControl, seg, gameShell, setBalance, setupCanvas, toastError, celebrate, sfx } from '../core.js';
 
 const TABLES = {
   8: { low: [5.6, 2.1, 1.1, 1, 0.5, 1, 1.1, 2.1, 5.6], medium: [13, 3, 1.3, 0.7, 0.4, 0.7, 1.3, 3, 13], high: [29, 4, 1.5, 0.3, 0.2, 0.3, 1.5, 4, 29] },
@@ -107,6 +107,10 @@ export function mountPlinko(view) {
     const t = (now - ball.start) / STEP;
     const R = ball.path.length;
     const k = Math.min(R, Math.max(0, Math.floor(t)));
+    if (k !== ball.lastRow && k < R) {
+      ball.lastRow = k;
+      if (k > 0) sfx.peg();
+    }
     const frac = Math.min(1, t - k);
     const rightsBefore = ball.path.slice(0, k).reduce((a, b) => a + b, 0);
     const xAt = (n, r) => geo.cx + (r - n / 2) * geo.spacing;
@@ -143,6 +147,9 @@ export function mountPlinko(view) {
     last.prepend(el);
     while (last.children.length > 14) last.lastChild.remove();
     if (r.betId === latestBetId) setBalance(r.balance);
+    if (r.multiplier >= 10) celebrate(r);
+    else if (r.multiplier >= 1) sfx.win();
+    else sfx.peg();
   }
 
   button.addEventListener('click', async () => {

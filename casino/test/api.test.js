@@ -18,6 +18,9 @@ const config = {
   secureCookies: false,
   trustProxy: false,
   rateLimit: false,
+  minWithdraw: 1000,
+  discordContact: 'wmz9',
+  admins: new Set(['boss']),
 };
 
 const stripe = new Stripe('sk_test_dummy');
@@ -232,6 +235,7 @@ test('crash: cash out early, bust when late, auto cash-out', async () => {
   const { msToReach } = require('../src/games/crash');
 
   await c('/api/games/crash/start', { method: 'POST', body: { wager: 1000 } });
+  setCrash(50);
   assert.equal((await c('/api/games/crash/start', { method: 'POST', body: { wager: 1000 } })).status, 400);
   setCrash(50, Date.now() - msToReach(2));
   const win = await c('/api/games/crash/cashout', { method: 'POST' });
@@ -349,4 +353,109 @@ test('history endpoints and client seed changes', async () => {
   assert.equal(bets.length, 1);
   assert.equal(bets[0].clientSeed, 'lucky-seed-67');
   assert.equal((await c('/api/me')).data.stats.bets, 1);
+});
+
+
+test('real Stripe paid-session payload credits the matching deposit', async () => {
+  const { c } = await newUser();
+  const before = await balanceOf(c);
+  await c('/api/wallet/deposit', { method: 'POST', body: { amount: 2500 } });
+  const ours = sessions.get(`cs_test_${sessionSeq}`);
+  const real = require('./fixtures/stripe-paid-session.json');
+  const session = { ...real, id: ours.id, metadata: ours.params.metadata };
+  const payload = JSON.stringify({ id: 'evt_real', object: 'event', type: 'checkout.session.completed', data: { object: session } });
+  const sig = stripe.webhooks.generateTestHeaderString({ payload, secret: WEBHOOK_SECRET });
+  const res = await fetch(`${base}/api/stripe/webhook`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Stripe-Signature': sig }, body: payload });
+  assert.equal((await res.json()).credited, true);
+  assert.equal(await balanceOf(c), before + 2500);
+});
+
+test('crates: catalog, open multiple, payout matches items', async () => {
+  const { c } = await newUser();
+  const { crates } = (await c('/api/crates')).data;
+  assert.deepEqual(crates.map((x) => x.id), ['bronze', 'silver', 'gold', 'diamond', 'vault']);
+  for (const cr of crates) {
+    assert.ok(cr.rtp >= 94.9 && cr.rtp <= 97.1, `${cr.id} rtp ${cr.rtp}`);
+    assert.ok(Math.abs(cr.items.reduce((s, i) => s + i.chance, 0) - 100) < 0.01);
+  }
+  const before = await balanceOf(c);
+  const r = await c('/api/games/crates/open', { method: 'POST', body: { crate: 'silver', quantity: 3 } });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.items.length, 3);
+  assert.equal(r.data.wager, 1500);
+  assert.equal(r.data.payout, r.data.items.reduce((s, i) => s + i.value, 0));
+  assert.equal(r.data.balance, before - 1500 + r.data.payout);
+  for (const body of [{ crate: 'nope' }, { crate: 'bronze', quantity: 6 }, { crate: 'bronze', quantity: 0 }, { crate: '__proto__' }]) {
+    assert.equal((await c('/api/games/crates/open', { method: 'POST', body })).status, 400, JSON.stringify(body));
+  }
+  db.prepare('UPDATE users SET balance = 50 WHERE username = ?').run(`player${userCounter}`);
+  assert.equal((await c('/api/games/crates/open', { method: 'POST', body: { crate: 'bronze' } })).status, 400);
+});
+
+test('withdrawals: eligibility, request, cancel, admin pay and reject', async () => {
+  const { c } = await newUser();
+  const uname = `player${userCounter}`;
+  const body = { amount: 2000, method: 'paypal', details: 'me@example.com', discord: '@Some.Player' };
+  const noDep = await c('/api/wallet/withdraw', { method: 'POST', body });
+  assert.equal(noDep.status, 400);
+  assert.match(noDep.data.error, /deposit/i);
+
+  await c('/api/wallet/deposit', { method: 'POST', body: { amount: 5000 } });
+  const s = sessions.get(`cs_test_${sessionSeq}`);
+  s.payment_status = 'paid';
+  await c(`/deposit/success?session_id=${s.id}`);
+  const playthrough = await c('/api/wallet/withdraw', { method: 'POST', body });
+  assert.match(playthrough.data.error, /Wager \$50\.00 more/);
+
+  await c('/api/games/crates/open', { method: 'POST', body: { crate: 'gold', quantity: 2 } });
+  const bal = await balanceOf(c);
+  assert.equal((await c('/api/wallet/withdraw', { method: 'POST', body: { ...body, amount: 500 } })).status, 400);
+  assert.equal((await c('/api/wallet/withdraw', { method: 'POST', body: { ...body, discord: 'x' } })).status, 400);
+  assert.equal((await c('/api/wallet/withdraw', { method: 'POST', body: { ...body, method: 'venmo2' } })).status, 400);
+  assert.equal((await c('/api/wallet/withdraw', { method: 'POST', body: { ...body, amount: bal + 100 } })).status, 400);
+
+  const ok = await c('/api/wallet/withdraw', { method: 'POST', body });
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+  assert.equal(ok.data.contact, 'wmz9');
+  assert.equal(ok.data.withdrawal.discord, 'some.player');
+  assert.equal(ok.data.balance, bal - 2000);
+  assert.equal((await c('/api/wallet/withdraw', { method: 'POST', body })).data.error, 'You already have a pending withdrawal');
+
+  const cancel = await c(`/api/wallet/withdrawals/${ok.data.withdrawal.id}/cancel`, { method: 'POST' });
+  assert.equal(cancel.data.balance, bal);
+  assert.equal((await c(`/api/wallet/withdrawals/${ok.data.withdrawal.id}/cancel`, { method: 'POST' })).status, 400);
+
+  assert.equal((await c('/api/admin/withdrawals')).status, 403);
+  const admin = client();
+  await admin('/api/auth/signup', { method: 'POST', body: { username: 'boss', email: 'boss@example.com', password: 'bossbossboss', ageConfirmed: true } });
+  assert.equal((await admin('/api/me')).data.user.isAdmin, true);
+
+  const w1 = (await c('/api/wallet/withdraw', { method: 'POST', body })).data.withdrawal;
+  const pending = (await admin('/api/admin/withdrawals?status=pending')).data.withdrawals;
+  assert.ok(pending.some((w) => w.id === w1.id && w.username === uname));
+  const paid = await admin(`/api/admin/withdrawals/${w1.id}/pay`, { method: 'POST', body: { note: 'PayPal txn 123' } });
+  assert.equal(paid.data.withdrawal.status, 'paid');
+  assert.equal(await balanceOf(c), bal - 2000);
+  assert.equal((await admin(`/api/admin/withdrawals/${w1.id}/reject`, { method: 'POST', body: {} })).status, 400);
+
+  const w2 = (await c('/api/wallet/withdraw', { method: 'POST', body: { ...body, amount: 1000 } })).data.withdrawal;
+  await admin(`/api/admin/withdrawals/${w2.id}/reject`, { method: 'POST', body: { note: 'Wrong details' } });
+  assert.equal(await balanceOf(c), bal - 2000);
+  const mine = (await c('/api/wallet/withdrawals')).data.withdrawals;
+  assert.deepEqual(mine.map((w) => w.status), ['rejected', 'paid', 'cancelled']);
+  assert.equal(mine[0].adminNote, 'Wrong details');
+  const types = (await c('/api/transactions')).data.transactions.map((t) => t.type);
+  assert.equal(types.filter((t) => t === 'withdrawal').length, 3);
+  assert.equal(types.filter((t) => t === 'withdrawal_refund').length, 2);
+  const o = (await admin('/api/admin/overview')).data;
+  assert.equal(o.withdrawalsPaid.total >= 2000, true);
+});
+
+test('live feed masks usernames', async () => {
+  const { c } = await newUser();
+  db.prepare("INSERT INTO bets (user_id, game, wager, payout, multiplier, detail, server_seed_hash, client_seed, nonce, created_at) VALUES ((SELECT id FROM users WHERE username = ?), 'dice', 100, 1000, 10, '{}', 'h', 'c', 0, ?)").run(`player${userCounter}`, Date.now());
+  const { wins } = (await c('/api/feed')).data;
+  assert.equal(wins[0].multiplier, 10);
+  assert.ok(!wins.some((w) => w.player.startsWith('player') && !w.player.includes('*')));
+  assert.match(wins[0].player, /^pl\*+$/);
 });

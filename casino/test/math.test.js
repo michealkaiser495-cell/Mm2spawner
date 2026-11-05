@@ -65,3 +65,23 @@ test('blackjack hand totals handle soft aces', () => {
   assert.deepEqual(total([A, SIX]), { value: 17, soft: true });
   assert.deepEqual(total([K, K, A]), { value: 21, soft: false });
 });
+
+
+test('crate odds: weights sum and RTP rises with crate price', () => {
+  const { CRATES, pick } = require('../src/games/crates');
+  let prev = 0;
+  for (const c of CRATES) {
+    const total = c.items.reduce((s, i) => s + i.weight, 0);
+    assert.equal(total, 1_000_000);
+    const rtp = c.items.reduce((s, i) => s + i.mult * i.weight, 0) / total;
+    assert.ok(rtp > prev && rtp < 0.975, `${c.id} ${rtp}`);
+    prev = rtp;
+    assert.equal(pick(c, 0), 0);
+    assert.equal(pick(c, 0.9999999), c.items.length - 1);
+  }
+  const bronze = CRATES[0];
+  const N = 200000;
+  const fl = floats('c'.repeat(64), 'crate', 0, N);
+  const sim = fl.reduce((s, f) => s + bronze.items[pick(bronze, f)].mult, 0) / N;
+  assert.ok(Math.abs(sim - 0.95) < 0.02, `simulated ${sim}`);
+});

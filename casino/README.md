@@ -3,10 +3,13 @@
 A full-stack casino website with:
 
 - **Accounts:** sign-up (18+ confirmation), login and logout. Passwords are hashed with scrypt; sessions use httpOnly cookies.
-- **Six games, all decided on the server:** Dice, Crash, Mines, Blackjack (with double and split), Plinko (8/12/16 rows, three risk levels) and European Roulette.
+- **Seven games, all decided on the server:** Crates (five tiers from $1 to $250, open up to 5 at once, prizes up to 1000×), Dice (with auto-bet), Crash, Mines, Blackjack (with double and split), Plinko (8/12/16 rows, three risk levels) and European Roulette.
+- **Extras:** sound effects with a mute toggle, a big-win celebration at 10× and above, a live wins feed in the lobby, and an animated balance.
 - **Provably fair results:** each bet comes from `HMAC-SHA256(serverSeed, clientSeed:nonce:round)`. Players see the hash of the server seed up front, can set their own client seed, and can rotate the server seed to reveal the old one. A built-in tool on the Fairness page re-checks any past result.
 - **Stripe Checkout deposits:** balances are credited by a signature-verified webhook and again when the player returns from Checkout. Crediting is idempotent, so a deposit never lands twice. The server also checks the amount and currency, and enforces min/max per deposit plus a 24-hour deposit limit.
-- **Wallet:** balance, deposit history, a full transaction ledger and bet history with stats.
+- **Withdrawals:** players submit a request (amount, payout method, payout details, Discord name). The amount is taken from their balance straight away and they're told to DM `DISCORD_CONTACT` (default **wmz9**) on Discord with the request ID. Admins pay the player outside the site, then mark the request **Paid** at `#/admin`. **Reject** refunds the balance, and players can cancel while a request is pending. Rules: at least one real deposit (the sign-up bonus can't be withdrawn), deposits must be wagered through once, and only one pending request at a time.
+- **Wallet:** balance, deposit and withdrawal history, a full transaction ledger and bet history with stats.
+- **Admin page** (`ADMIN_USERNAMES`): player count, deposits, payouts, pending withdrawals, house profit and total player balances.
 
 Stack: Node.js 22.5+, Express 5, built-in `node:sqlite`, vanilla JS front end (no build step).
 
@@ -38,19 +41,22 @@ In production, add a Dashboard webhook endpoint at `https://YOUR_DOMAIN/api/stri
 npm test
 ```
 
-The 16 tests cover:
+The 21 tests cover:
 
 - sign-up and login validation, sessions, and CSRF/origin blocking
 - every game's payout accounting, plus re-deriving dice and mines results from the revealed seed
 - crash cash-out, bust and auto cash-out
 - 40 blackjack hands played out with doubles and splits
 - the Stripe flow: forged webhook signatures rejected, replayed webhooks ignored, tampered amounts rejected, daily limit enforced
-- house-edge math: every Plinko table pays back 98–100%, the crash distribution, and the dice and mines multipliers
+- house-edge math: every Plinko table pays back 98–100%, the crash distribution, the dice and mines multipliers, and the crate odds
+- crates, the full withdrawal lifecycle including admin pay/reject, and the live feed's username masking
+- a real paid Checkout session from the Stripe test account (`test/fixtures/stripe-paid-session.json`) going through the signed webhook and crediting the balance
 
 ## House edge
 
 | Game | Return to player |
 | --- | --- |
+| Crates | 95% (Bronze) → 95.5% → 96% → 96.5% → 97% (Vault) |
 | Dice, Crash, Mines | 99% |
 | Plinko | 98.9–99.1% depending on table |
 | Roulette | 97.3% (single zero) |
@@ -62,7 +68,7 @@ Taking real-money deposits for games of chance is **regulated gambling** in most
 
 Stripe **does not allow gambling businesses without prior written approval** (see Stripe's Restricted Businesses list). Running this on a live key without that approval will get the account shut down and the funds held.
 
-Keep it on `sk_test_` keys, or run it as a free-to-play social casino, until you have both a licence and Stripe's approval. As built, credits cannot be withdrawn.
+Keep it on `sk_test_` keys until you have both a licence and Stripe's approval. Paying out winnings by hand through Discord DMs is also the kind of setup payment processors and regulators look at closely, so keep the admin page's records accurate.
 
 ## Layout
 
