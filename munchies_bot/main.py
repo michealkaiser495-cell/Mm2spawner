@@ -1,12 +1,18 @@
 """
-Munchies Order Desk - Discord ticket bot (discord.py 2.4+)
+Munchies Order Desk v2 - Discord ticket bot (discord.py 2.7+)
 
 Run:
-    pip install -U "discord.py>=2.4"
+    pip install -U "discord.py>=2.7"
     python main.py
 
-Token: set DISCORD_TOKEN env var, or paste it into TOKEN below.
-Developer Portal -> Bot -> enable "MESSAGE CONTENT INTENT" (required).
+Token: paste it into TOKEN below, or set the DISCORD_TOKEN environment variable.
+
+Who can use slash commands: the server owner / administrators and the chef role.
+Setup commands (/ticket /setchef /setlogs /panel) are owner/admin only.
+
+Message Content Intent (Developer Portal -> Bot) is OPTIONAL:
+  - ON : customers can answer each step with pop-up forms OR by typing in chat.
+  - OFF: customers answer with pop-up forms (buttons). Nothing crashes.
 """
 
 from __future__ import annotations
@@ -14,8 +20,14 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import re
+import sys
+import time
+import traceback
+import urllib.error
+import urllib.request
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional
@@ -23,17 +35,23 @@ from typing import Optional
 import discord
 from discord import app_commands
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Config
-# --------------------------------------------------------------------------
+# ==========================================================================
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip() or "PASTE_YOUR_BOT_TOKEN_HERE"
 
 BRAND = "Munchies"
 CURRENCY = "$"
-PRICE_DIVISOR = Decimal(3)          # customer pays 1/3 of the order total
+PRICE_DIVISOR = Decimal(3)              # customer pays 1/3 of the order total
 MAX_ORDER_TOTAL = Decimal("100000")
 CLOSE_DELAY_SECONDS = 5
+TICKET_COOLDOWN_SECONDS = 10
 DATA_FILE = Path(__file__).with_name("munchies_data.json")
+
+PAYMENT_METHODS = [
+    ("Cash App", "💵"), ("PayPal", "🅿️"), ("Venmo", "💙"), ("Zelle", "⚡"),
+    ("Apple Pay", "🍎"), ("Crypto", "🪙"), ("Other", "💳"),
+]
 
 COLOR_GREEN = 0x57F287
 COLOR_BLURPLE = 0x5865F2
@@ -44,30 +62,34 @@ COLOR_BLUE = 0x3498DB
 COLOR_DARK = 0x2B2D31
 
 KIND_INFO = {
-    "order":   {"prefix": "order",   "title": "🧾 Order Ticket",   "color": COLOR_BLURPLE},
+    "order":   {"prefix": "order",   "title": "🧾 Order Ticket",     "color": COLOR_BLURPLE},
     "vip":     {"prefix": "vip",     "title": "⭐ VIP Order Ticket", "color": COLOR_GOLD},
-    "support": {"prefix": "support", "title": "💬 Support Ticket", "color": COLOR_DARK},
+    "support": {"prefix": "support", "title": "💬 Support Ticket",   "color": COLOR_DARK},
 }
 
+INTENT_MESSAGE_CONTENT = (1 << 18) | (1 << 19)   # GATEWAY_MESSAGE_CONTENT | _LIMITED
+TYPED_INPUT = True                                # set at startup from the app's intent setting
 
-# --------------------------------------------------------------------------
-# Persistent storage (JSON file next to main.py)
-# --------------------------------------------------------------------------
+log = logging.getLogger("munchies")
+
+
+# ==========================================================================
+# Storage (JSON file next to main.py)
+# ==========================================================================
 class Store:
     GUILD_DEFAULTS = {
-        "staff_role": None,
-        "chef_role": None,
-        "vip_role": None,
-        "category": None,
-        "log_channel": None,
-        "panels": [],        # [[channel_id, message_id], ...]
-        "clocked_in": [],    # [user_id, ...]
+        "staff_role": None, "chef_role": None, "vip_role": None,
+        "category": None, "log_channel": None,
+        "panels": [],            # [[channel_id, message_id], ...]
+        "clocked_in": {},        # {user_id: unix_since}
+        "stats": {},             # {user_id: {"orders": int, "revenue": str, "seconds": int}}
+        "orders_completed": 0,
         "counter": 0,
     }
 
     def __init__(self, path: Path):
         self.path = path
-        self.data: dict = {"guilds": {}, "tickets": {}}
+        self.data: dict = {}
         self.load()
 
     def load(self) -> None:
@@ -76,7 +98,7 @@ class Store:
                 self.data = json.loads(self.path.read_text("utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 backup = self.path.with_suffix(".corrupt.json")
-                print(f"[store] could not read {self.path.name}: {exc} -> moved to {backup.name}")
+                log.error("Could not read %s (%s) - moved to %s", self.path.name, exc, backup.name)
                 try:
                     os.replace(self.path, backup)
                 except OSError:
@@ -94,8 +116,18 @@ class Store:
         g = self.data["guilds"].setdefault(str(guild_id), {})
         for key, value in self.GUILD_DEFAULTS.items():
             if key not in g:
-                g[key] = list(value) if isinstance(value, list) else value
+                g[key] = value.copy() if isinstance(value, (list, dict)) else value
+        if isinstance(g["clocked_in"], list):          # migrate v1 format
+            now = int(time.time())
+            g["clocked_in"] = {str(uid): now for uid in g["clocked_in"]}
         return g
+
+    def stats(self, guild_id: int, user_id: int) -> dict:
+        s = self.guild(guild_id)["stats"].setdefault(str(user_id), {})
+        s.setdefault("orders", 0)
+        s.setdefault("revenue", "0")
+        s.setdefault("seconds", 0)
+        return s
 
     def ticket(self, channel_id: int) -> Optional[dict]:
         return self.data["tickets"].get(str(channel_id))
@@ -114,24 +146,25 @@ class Store:
 
 store = Store(DATA_FILE)
 channel_locks: dict[int, asyncio.Lock] = {}
+ticket_cooldowns: dict[int, float] = {}
 
 
 def lock_for(channel_id: int) -> asyncio.Lock:
     return channel_locks.setdefault(channel_id, asyncio.Lock())
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Helpers
-# --------------------------------------------------------------------------
+# ==========================================================================
 class TicketError(Exception):
     """Validation failure shown to the user as an ephemeral error."""
 
 
-def mention(user_id: Optional[int]) -> str:
+def mention(user_id) -> str:
     return f"<@{user_id}>" if user_id else "—"
 
 
-def role_mention(role_id: Optional[int]) -> str:
+def role_mention(role_id) -> str:
     return f"<@&{role_id}>" if role_id else "*not set*"
 
 
@@ -139,25 +172,48 @@ def money(value: Decimal) -> str:
     return f"{CURRENCY}{value:,.2f}"
 
 
+def ts(unix: int, style: str = "R") -> str:
+    return f"<t:{int(unix)}:{style}>"
+
+
+def duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m = rem // 60
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def progress(step: int, total: int = 4) -> str:
+    return "🟩" * step + "⬜" * (total - step) + f"  **Step {step} of {total}**"
+
+
 def stamp(embed: discord.Embed, extra: Optional[str] = None) -> discord.Embed:
-    text = f"{BRAND} • Order Desk"
-    if extra:
-        text += f" • {extra}"
+    text = f"{BRAND} • Order Desk" + (f" • {extra}" if extra else "")
     embed.set_footer(text=text)
     embed.timestamp = discord.utils.utcnow()
     return embed
 
 
-def has_role(member: discord.Member, role_id: Optional[int]) -> bool:
+def has_role(member: discord.Member, role_id) -> bool:
     return role_id is not None and any(r.id == role_id for r in member.roles)
 
 
-def is_admin(member: discord.Member) -> bool:
-    return member.guild_permissions.administrator
+def is_owner(member: discord.Member) -> bool:
+    """Server owner or administrator."""
+    return member.guild.owner_id == member.id or member.guild_permissions.administrator
+
+
+def is_chef(member: discord.Member, g: dict) -> bool:
+    return has_role(member, g["chef_role"])
+
+
+def can_use_commands(member: discord.Member, g: dict) -> bool:
+    return is_owner(member) or is_chef(member, g)
 
 
 def is_staff(member: discord.Member, g: dict) -> bool:
-    return is_admin(member) or has_role(member, g["staff_role"]) or has_role(member, g["chef_role"])
+    """Who may press staff buttons (claim etc.)."""
+    return is_owner(member) or is_chef(member, g) or has_role(member, g["staff_role"])
 
 
 def slugify(name: str) -> str:
@@ -170,7 +226,7 @@ MONEY_RE = re.compile(r"(\$)?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?")
 
 def parse_total(text: str) -> tuple[Optional[Decimal], bool]:
     """Return (amount, ambiguous). Prefers a $-prefixed number; otherwise needs exactly one number."""
-    matches = list(MONEY_RE.finditer(text))
+    matches = list(MONEY_RE.finditer(text or ""))
     if not matches:
         return None, False
     dollars = [m for m in matches if m.group(1)]
@@ -194,17 +250,19 @@ def customer_share(total: Decimal) -> Decimal:
     return (total / PRICE_DIVISOR).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic")
+
+
+def is_image(att: discord.Attachment) -> bool:
+    return (att.content_type or "").startswith("image/") or att.filename.lower().endswith(IMAGE_EXTS)
+
+
 def image_attachments(message: discord.Message) -> list[discord.Attachment]:
-    exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic")
-    return [
-        a for a in message.attachments
-        if (a.content_type or "").startswith("image/") or a.filename.lower().endswith(exts)
-    ]
+    return [a for a in message.attachments if is_image(a)]
 
 
 async def send_error(interaction: discord.Interaction, text: str) -> None:
-    embed = discord.Embed(title="⚠️ Can't do that", description=text, color=COLOR_RED)
-    stamp(embed)
+    embed = stamp(discord.Embed(title="⚠️ Can't do that", description=text, color=COLOR_RED))
     try:
         if interaction.response.is_done():
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -225,7 +283,6 @@ async def ack(interaction: discord.Interaction) -> None:
 
 
 async def finish(interaction: discord.Interaction, text: str) -> None:
-    """Close out a slash-command 'thinking' state. Buttons need nothing."""
     if interaction.type == discord.InteractionType.application_command:
         try:
             await interaction.followup.send(text, ephemeral=True)
@@ -233,55 +290,77 @@ async def finish(interaction: discord.Interaction, text: str) -> None:
             pass
 
 
-def get_ticket_or_fail(channel: discord.abc.GuildChannel) -> dict:
-    ticket = store.ticket(channel.id)
+def get_ticket_or_fail(channel) -> dict:
+    ticket = store.ticket(channel.id) if channel else None
     if ticket is None:
-        raise TicketError("This command only works inside a ticket channel.")
+        raise TicketError("This only works inside a ticket channel.")
     return ticket
 
 
-# --------------------------------------------------------------------------
+def location_lines(t: dict) -> str:
+    lines = []
+    if t.get("restaurant"):
+        lines.append(f"🏪 **Restaurant:** {t['restaurant']}")
+    lines.append(f"📍 **Address:** {t['address']}")
+    if t.get("notes"):
+        lines.append(f"📝 **Notes:** {t['notes']}")
+    return "\n".join(lines)[:1024]
+
+
+def payment_text(t: dict) -> str:
+    return (t.get("payment") or "—")[:1024]
+
+
+# ==========================================================================
 # Embeds
-# --------------------------------------------------------------------------
-def panel_embed(g: dict) -> discord.Embed:
+# ==========================================================================
+def panel_embed(guild: Optional[discord.Guild], g: dict) -> discord.Embed:
     online = g["clocked_in"]
-    staff_text = "\n".join(mention(uid) for uid in online) if online else "*No staff clocked in right now*"
+    staff_text = "\n".join(f"{mention(uid)} — on since {ts(since)}" for uid, since in online.items()) \
+        if online else "*No staff clocked in right now*"
     embed = discord.Embed(
         title=f"🍽️ {BRAND} Order Desk",
-        description="Click **Create Order** below to open a private order ticket with staff.",
+        description=(
+            "Click **Create Order** below to open a private order ticket with staff.\n\n"
+            "🧾 **Create Order** — place a new order\n"
+            "💬 **Support** — questions, problems or refunds\n"
+            "⭐ **VIP** — priority order queue"
+        ),
         color=COLOR_GREEN,
     )
     embed.add_field(name="Status", value="🟢 Open — taking orders", inline=False)
     embed.add_field(name="Staff Online", value=staff_text[:1024], inline=False)
+    embed.add_field(name="📦 Orders Completed", value=f"**{g['orders_completed']:,}**", inline=True)
+    embed.add_field(name="💰 You Pay", value=f"Only **1/{PRICE_DIVISOR}** of your total", inline=True)
+    if guild and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
     return stamp(embed)
 
 
 def welcome_embed(ticket: dict, g: dict) -> discord.Embed:
     info = KIND_INFO[ticket["kind"]]
-    embed = discord.Embed(
-        title=f"{info['title']} #{ticket['number']:04d}",
-        color=info["color"],
-    )
+    embed = discord.Embed(title=f"{info['title']} #{ticket['number']:04d}", color=info["color"])
     if ticket["kind"] == "support":
         embed.description = (
             f"Welcome {mention(ticket['owner_id'])}! 👋\n\n"
             "**Describe your issue below** and a staff member will help you as soon as possible.\n"
-            "Please include any order details, screenshots, or links that help explain the problem."
+            "Include your order number, screenshots, or anything that explains the problem."
         )
     else:
-        vip = "\n⭐ **VIP priority** — your order goes to the front of the line.\n" if ticket["kind"] == "vip" else ""
+        vip = "\n⭐ **VIP priority** — your order skips the line.\n" if ticket["kind"] == "vip" else ""
+        typed = " (or just type your answers in chat)" if TYPED_INPUT else ""
         embed.description = (
             f"Welcome {mention(ticket['owner_id'])}! 👋\n{vip}\n"
-            "Answer the questions below and your order will be sent to the kitchen."
+            f"Follow the steps below — press the button on each step to fill in a quick form{typed}."
         )
         embed.add_field(
             name="📋 How it works",
             value=(
-                "**1.** Send the restaurant + your full address\n"
-                "**2.** Confirm the address is correct\n"
-                "**3.** Send the order screenshot + total (with tax & delivery)\n"
-                f"**4.** Pay **1/{PRICE_DIVISOR}** of the total & tell us your payment method\n"
-                "**5.** A chef claims your order and gets it done ✅"
+                "**1.** 🏪 Restaurant + your full address\n"
+                "**2.** 📍 Confirm the address is correct\n"
+                "**3.** 📸 Order screenshot + total (with tax & delivery)\n"
+                f"**4.** 💳 You pay **1/{PRICE_DIVISOR}** of the total — pick your payment\n"
+                "**5.** 🧑‍🍳 A chef claims your order and gets it done ✅"
             ),
             inline=False,
         )
@@ -291,105 +370,96 @@ def welcome_embed(ticket: dict, g: dict) -> discord.Embed:
         value=(" ".join(mention(u) for u in online) if online else "*No staff clocked in — someone will be with you soon*")[:1024],
         inline=False,
     )
-    embed.add_field(name="🔒 Done?", value="Press **Close Ticket** below or use `/close`.", inline=False)
+    embed.add_field(name="🕒 Opened", value=ts(ticket["opened_at"], "f"), inline=True)
+    embed.add_field(name="🔒 Done?", value="Press **Close Ticket** below.", inline=True)
     return stamp(embed, f"Ticket #{ticket['number']:04d}")
 
 
 def step_address_embed(retry: bool = False) -> discord.Embed:
+    typed = "\n\n💬 You can also **type it in one message** below." if TYPED_INPUT else ""
     if retry:
         embed = discord.Embed(
             title="✏️ Retype Your Address",
-            description=(
-                "No problem! **Retype the restaurant and your full address** and send it to me "
-                "as **one message** below."
-            ),
+            description=(f"{progress(1)}\n\nNo problem! Press **Enter Restaurant & Address** and send me "
+                         f"the **correct** restaurant and full address.{typed}"),
             color=COLOR_ORANGE,
         )
     else:
         embed = discord.Embed(
-            title="🏪 Step 1 of 4 — Restaurant & Address",
-            description=(
-                "**What's the restaurant and your full address?**\n"
-                "Type both in **one message** below."
-            ),
+            title="🏪 Step 1 — Restaurant & Address",
+            description=(f"{progress(1)}\n\n**What's the restaurant and your full address?**\n"
+                         f"Press **Enter Restaurant & Address** below.{typed}"),
             color=COLOR_BLURPLE,
         )
-    embed.add_field(
-        name="📝 Example",
-        value="```\nChipotle\n123 Main St, Apt 4B, Springfield, IL 62704\n```",
-        inline=False,
-    )
-    embed.add_field(
-        name="💡 Tip",
-        value="Include apartment / unit number, city, state and ZIP so nothing goes wrong.",
-        inline=False,
-    )
+    embed.add_field(name="📝 Example",
+                    value="```\nChipotle\n123 Main St, Apt 4B, Springfield, IL 62704\n```", inline=False)
+    embed.add_field(name="💡 Tip",
+                    value="Include apartment / unit number, city, state and ZIP so nothing goes wrong.", inline=False)
     return stamp(embed, "Step 1/4")
 
 
-def step_confirm_embed(address: str) -> discord.Embed:
+def step_confirm_embed(t: dict) -> discord.Embed:
     embed = discord.Embed(
-        title="📍 Step 2 of 4 — Are you correct?",
-        description="Double-check the restaurant and address below, then press **Yes** or **No**.",
+        title="📍 Step 2 — Are you correct?",
+        description=f"{progress(2)}\n\nDouble-check everything below, then press **Yes** or **No**.",
         color=COLOR_GOLD,
     )
-    embed.add_field(name="🏪 Restaurant & Address", value=f">>> {address}"[:1024], inline=False)
-    embed.add_field(
-        name="❓ What next",
-        value="✅ **Yes** — continue to the order screenshot\n❌ **No** — retype your address",
-        inline=False,
-    )
+    embed.add_field(name="🏠 Delivery Details", value=location_lines(t), inline=False)
+    embed.add_field(name="❓ What next",
+                    value="✅ **Yes** — continue to the order screenshot\n❌ **No** — retype your address",
+                    inline=False)
     return stamp(embed, "Step 2/4")
 
 
 def step_screenshot_embed() -> discord.Embed:
+    typed = ("\n\n💬 You can also **attach the screenshot and type the total** in chat "
+             "(same message or one after the other).") if TYPED_INPUT else ""
     embed = discord.Embed(
-        title="🧾 Step 3 of 4 — Order Screenshot & Total",
-        description=(
-            "Send me the **screenshot of the order** and the **order total with tax and delivery**.\n\n"
-            "Attach the screenshot and type the total in the same message — or send them one after the other."
-        ),
+        title="🧾 Step 3 — Order Screenshot & Total",
+        description=(f"{progress(3)}\n\nSend me the **screenshot of the order** and the "
+                     f"**order total with tax and delivery**.\nPress **Upload Screenshot & Total** below.{typed}"),
         color=COLOR_BLURPLE,
     )
-    embed.add_field(name="📸 Screenshot", value="Upload an image of your cart / checkout page.", inline=True)
+    embed.add_field(name="📸 Screenshot", value="Your cart / checkout page showing the items and total.", inline=True)
     embed.add_field(name="💲 Total", value="Example: `$30.00`", inline=True)
     return stamp(embed, "Step 3/4")
 
 
 def step_payment_embed(total: Decimal, due: Decimal) -> discord.Embed:
+    typed = "\n💬 Or just **type your payment method** in chat." if TYPED_INPUT else ""
     embed = discord.Embed(
-        title="💵 Step 4 of 4 — Payment",
-        description=(
-            f"Your order is **{money(due)}**\n\n"
-            "**What payment are you using?** Type it below "
-            "(e.g. Cash App, PayPal, Venmo, Zelle, Apple Pay, Crypto)."
-        ),
+        title="💵 Step 4 — Payment",
+        description=(f"{progress(4)}\n\n# Your order is {money(due)}\n"
+                     f"**What payment are you using?** Press **Choose Payment** below.{typed}"),
         color=COLOR_GREEN,
     )
     embed.add_field(name="🧾 Order Total", value=money(total), inline=True)
     embed.add_field(name=f"✂️ You Pay (1/{PRICE_DIVISOR})", value=f"**{money(due)}**", inline=True)
     embed.add_field(name="💰 You Save", value=money(total - due), inline=True)
+    embed.add_field(name="💳 Accepted", value=" • ".join(f"{e} {n}" for n, e in PAYMENT_METHODS), inline=False)
     return stamp(embed, "Step 4/4")
 
 
-def summary_embed(ticket: dict, status: str, with_image: Optional[str]) -> discord.Embed:
-    vip = ticket["kind"] == "vip"
+def summary_embed(t: dict, status: str, image_name: Optional[str]) -> discord.Embed:
+    vip = t["kind"] == "vip"
     embed = discord.Embed(
         title=("⭐ VIP " if vip else "") + "🧑‍🍳 New Order — Ready for a Chef",
-        description=f"Order from {mention(ticket['owner_id'])} has been submitted to the kitchen.",
+        description=f"Order **#{t['number']:04d}** from {mention(t['owner_id'])} has been sent to the kitchen. 🔥",
         color=COLOR_GOLD if vip else COLOR_ORANGE,
     )
-    embed.add_field(name="👤 Customer", value=mention(ticket["owner_id"]), inline=True)
-    embed.add_field(name="🎫 Ticket", value=f"#{ticket['number']:04d}", inline=True)
-    embed.add_field(name="⭐ Priority", value="VIP" if vip else "Standard", inline=True)
-    embed.add_field(name="🏪 Restaurant & Address", value=f">>> {ticket['address']}"[:1024], inline=False)
-    embed.add_field(name="🧾 Order Total", value=money(Decimal(ticket["total"])), inline=True)
-    embed.add_field(name="💵 Customer Pays", value=f"**{money(Decimal(ticket['due']))}**", inline=True)
-    embed.add_field(name="💳 Payment", value=ticket["payment"][:1024], inline=True)
+    embed.add_field(name="👤 Customer", value=mention(t["owner_id"]), inline=True)
+    embed.add_field(name="🆔 Order", value=f"#{t['number']:04d}", inline=True)
+    embed.add_field(name="⭐ Priority", value="**VIP**" if vip else "Standard", inline=True)
+    embed.add_field(name="🏠 Delivery Details", value=location_lines(t), inline=False)
+    embed.add_field(name="🧾 Order Total", value=money(Decimal(t["total"])), inline=True)
+    embed.add_field(name="💵 Customer Pays", value=f"**{money(Decimal(t['due']))}**", inline=True)
+    embed.add_field(name="💳 Payment", value=payment_text(t), inline=True)
+    embed.add_field(name="🕒 Opened", value=ts(t["opened_at"]), inline=True)
+    embed.add_field(name="📨 Submitted", value=ts(t.get("submitted_at") or time.time()), inline=True)
     embed.add_field(name="📌 Status", value=status, inline=False)
-    if with_image:
-        embed.set_image(url=f"attachment://{with_image}")
-    return stamp(embed, f"Ticket #{ticket['number']:04d}")
+    if image_name:
+        embed.set_image(url=f"attachment://{image_name}")
+    return stamp(embed, f"Order #{t['number']:04d}")
 
 
 def status_waiting() -> str:
@@ -397,16 +467,94 @@ def status_waiting() -> str:
 
 
 def status_claimed(user_id: int) -> str:
-    return f"🔵 Claimed by {mention(user_id)}"
+    return f"🔵 Claimed by {mention(user_id)} — cooking now 🍳"
 
 
 def status_done(user_id: int) -> str:
     return f"✅ Completed by {mention(user_id)}"
 
 
-# --------------------------------------------------------------------------
-# Views (all persistent: they keep working after a bot restart)
-# --------------------------------------------------------------------------
+def note(text: str, color: int = COLOR_ORANGE, extra: Optional[str] = None) -> discord.Embed:
+    return stamp(discord.Embed(description=text, color=color), extra)
+
+
+# ==========================================================================
+# Modals (pop-up forms) - work without the Message Content intent
+# ==========================================================================
+class AddressModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="🏪 Restaurant & Address", timeout=900)
+        self.restaurant = discord.ui.TextInput(placeholder="e.g. Chipotle", max_length=100)
+        self.address = discord.ui.TextInput(style=discord.TextStyle.paragraph, min_length=5, max_length=500,
+                                            placeholder="Street, Apt/Unit, City, State, ZIP")
+        self.notes = discord.ui.TextInput(style=discord.TextStyle.paragraph, required=False, max_length=300,
+                                          placeholder="Gate code, leave at door, call on arrival… (optional)")
+        self.add_item(discord.ui.Label(text="Restaurant", description="Which restaurant are you ordering from?",
+                                       component=self.restaurant))
+        self.add_item(discord.ui.Label(text="Full delivery address", description="Include unit number and ZIP",
+                                       component=self.address))
+        self.add_item(discord.ui.Label(text="Delivery notes", description="Anything the driver should know",
+                                       component=self.notes))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await submit_address_interaction(interaction, self.restaurant.value.strip(),
+                                         self.address.value.strip(), self.notes.value.strip())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("AddressModal failed", exc_info=error)
+        await send_error(interaction, "Something went wrong saving your address. Please try again.")
+
+
+class ScreenshotModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="📸 Order Screenshot & Total", timeout=900)
+        self.shot = discord.ui.FileUpload(required=True, min_values=1, max_values=1)
+        self.total = discord.ui.TextInput(placeholder="$30.00", max_length=20)
+        self.add_item(discord.ui.Label(text="Order screenshot",
+                                       description="Screenshot of your cart / checkout with the items and total",
+                                       component=self.shot))
+        self.add_item(discord.ui.Label(text="Order total (with tax & delivery)",
+                                       description="Just the number, e.g. 30.00", component=self.total))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await submit_screenshot_interaction(interaction, self.shot.values, self.total.value)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("ScreenshotModal failed", exc_info=error)
+        await send_error(interaction, "Something went wrong with your upload. Please try again.")
+
+
+class PaymentModal(discord.ui.Modal):
+    def __init__(self, due: str):
+        super().__init__(title=f"💳 Payment — {money(Decimal(due))}", timeout=900)
+        self.method = discord.ui.Select(
+            placeholder="Choose a payment method",
+            options=[discord.SelectOption(label=n, emoji=e, value=n) for n, e in PAYMENT_METHODS],
+        )
+        self.details = discord.ui.TextInput(required=False, max_length=100,
+                                            placeholder="Your $cashtag / @username / which coin (optional)")
+        self.add_item(discord.ui.Label(text="Payment method", description="How are you paying?",
+                                       component=self.method))
+        self.add_item(discord.ui.Label(text="Payment name / details",
+                                       description="Required if you picked Other", component=self.details))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        method = self.method.values[0] if self.method.values else ""
+        details = self.details.value.strip()
+        if method == "Other" and not details:
+            return await send_error(interaction, "You picked **Other** — tell us which payment method in the details box.")
+        emoji = dict(PAYMENT_METHODS).get(method, "💳")
+        text = f"{emoji} {method}" + (f" — {details}" if details else "")
+        await submit_payment_interaction(interaction, text)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("PaymentModal failed", exc_info=error)
+        await send_error(interaction, "Something went wrong saving your payment. Please try again.")
+
+
+# ==========================================================================
+# Views (persistent: keep working after a restart)
+# ==========================================================================
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -441,10 +589,7 @@ class TicketControlView(discord.ui.View):
             return await send_error(interaction, str(exc))
         embed = discord.Embed(
             title="🔒 Close this ticket?",
-            description=(
-                "The channel will be **deleted** and a transcript saved to the log channel.\n"
-                "This can't be undone."
-            ),
+            description="The channel will be **deleted** and a transcript saved to the log channel.\nThis can't be undone.",
             color=COLOR_RED,
         )
         await interaction.response.send_message(embed=stamp(embed), view=CloseConfirmView(), ephemeral=True)
@@ -465,6 +610,62 @@ class CloseConfirmView(discord.ui.View):
     @discord.ui.button(label="Cancel", emoji="✖️", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Cancelled — ticket stays open.", embed=None, view=None)
+
+
+class DoneView(discord.ui.View):
+    """Disabled marker that replaces a finished step's button."""
+
+    def __init__(self, label: str = "Done"):
+        super().__init__(timeout=1)
+        self.add_item(discord.ui.Button(label=label, emoji="✅", style=discord.ButtonStyle.secondary, disabled=True))
+
+
+async def step_guard(interaction: discord.Interaction, stage: str) -> Optional[dict]:
+    ticket = store.ticket(interaction.channel.id) if interaction.channel else None
+    if ticket is None:
+        await send_error(interaction, "This ticket no longer exists.")
+        return None
+    if interaction.user.id != ticket["owner_id"] and not is_owner(interaction.user):
+        await send_error(interaction, "Only the customer who opened this ticket can fill this in.")
+        return None
+    if ticket["stage"] != stage:
+        await send_error(interaction, "This step is already done — check the latest message below.")
+        return None
+    return ticket
+
+
+class AddressStepView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Enter Restaurant & Address", emoji="📝", style=discord.ButtonStyle.primary,
+                       custom_id="munchies:step:address")
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await step_guard(interaction, "address"):
+            await interaction.response.send_modal(AddressModal())
+
+
+class ShotStepView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Upload Screenshot & Total", emoji="📸", style=discord.ButtonStyle.primary,
+                       custom_id="munchies:step:shot")
+    async def upload(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await step_guard(interaction, "screenshot"):
+            await interaction.response.send_modal(ScreenshotModal())
+
+
+class PayStepView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Choose Payment", emoji="💳", style=discord.ButtonStyle.success,
+                       custom_id="munchies:step:pay")
+    async def pay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ticket = await step_guard(interaction, "payment")
+        if ticket:
+            await interaction.response.send_modal(PaymentModal(ticket["due"]))
 
 
 class AddressConfirmView(discord.ui.View):
@@ -522,9 +723,13 @@ class ClaimedView(discord.ui.View):
         await do_complete(interaction)
 
 
-# --------------------------------------------------------------------------
-# Panel refresh
-# --------------------------------------------------------------------------
+PERSISTENT_VIEWS = (PanelView, TicketControlView, AddressStepView, ShotStepView, PayStepView,
+                    AddressConfirmView, ClaimView, ClaimedView)
+
+
+# ==========================================================================
+# Panels
+# ==========================================================================
 async def refresh_panels(guild: discord.Guild) -> None:
     g = store.guild(guild.id)
     keep = []
@@ -533,50 +738,53 @@ async def refresh_panels(guild: discord.Guild) -> None:
         if not isinstance(channel, discord.TextChannel):
             continue
         try:
-            await channel.get_partial_message(message_id).edit(embed=panel_embed(g), view=PanelView())
+            await channel.get_partial_message(message_id).edit(embed=panel_embed(guild, g), view=PanelView())
             keep.append([channel_id, message_id])
         except discord.NotFound:
             continue
         except discord.HTTPException as exc:
-            print(f"[panel] could not update {channel_id}/{message_id}: {exc}")
+            log.warning("Could not update panel %s/%s: %s", channel_id, message_id, exc)
             keep.append([channel_id, message_id])
     if keep != g["panels"]:
         g["panels"] = keep
         store.save()
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Ticket creation
-# --------------------------------------------------------------------------
+# ==========================================================================
+def member_overwrite() -> discord.PermissionOverwrite:
+    return discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True,
+                                       embed_links=True, read_message_history=True)
+
+
 def staff_overwrite(can_send: bool) -> discord.PermissionOverwrite:
-    return discord.PermissionOverwrite(
-        view_channel=True, send_messages=can_send, attach_files=can_send,
-        embed_links=can_send, read_message_history=True,
-    )
+    return discord.PermissionOverwrite(view_channel=True, send_messages=can_send, attach_files=can_send,
+                                       embed_links=can_send, read_message_history=True)
 
 
 async def open_ticket(interaction: discord.Interaction, kind: str) -> None:
-    guild = interaction.guild
-    member = interaction.user
+    guild, member = interaction.guild, interaction.user
     if guild is None or not isinstance(member, discord.Member):
         return await send_error(interaction, "Tickets can only be opened inside a server.")
 
     g = store.guild(guild.id)
     category = guild.get_channel(g["category"]) if g["category"] else None
     if not isinstance(category, discord.CategoryChannel) or not g["staff_role"]:
-        return await send_error(interaction, "The ticket system isn't set up yet. An admin needs to run `/ticket`.")
+        return await send_error(interaction, "The ticket system isn't set up yet. The server owner needs to run `/ticket`.")
 
-    if kind == "vip" and g["vip_role"] and not has_role(member, g["vip_role"]) and not is_admin(member):
-        return await send_error(
-            interaction,
-            f"⭐ VIP tickets are only for members with {role_mention(g['vip_role'])}.\n"
-            "Use **Create Order** instead.",
-        )
+    if kind == "vip" and g["vip_role"] and not has_role(member, g["vip_role"]) and not is_owner(member):
+        return await send_error(interaction, f"⭐ VIP tickets are only for {role_mention(g['vip_role'])}.\n"
+                                             "Use **Create Order** instead.")
 
     for cid, t in store.tickets().items():
-        if t["guild_id"] == guild.id and t["owner_id"] == member.id and t["kind"] == kind:
-            if guild.get_channel(int(cid)):
-                return await send_error(interaction, f"You already have an open {kind} ticket: <#{cid}>")
+        if t["guild_id"] == guild.id and t["owner_id"] == member.id and t["kind"] == kind and guild.get_channel(int(cid)):
+            return await send_error(interaction, f"You already have an open {kind} ticket: <#{cid}>")
+
+    wait = ticket_cooldowns.get(member.id, 0) + TICKET_COOLDOWN_SECONDS - time.monotonic()
+    if wait > 0:
+        return await send_error(interaction, f"Slow down! Try again in **{wait:.0f}s**.")
+    ticket_cooldowns[member.id] = time.monotonic()
 
     await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -587,14 +795,8 @@ async def open_ticket(interaction: discord.Interaction, kind: str) -> None:
     info = KIND_INFO[kind]
     overwrites: dict = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, attach_files=True,
-            embed_links=True, read_message_history=True,
-        ),
-        guild.me: discord.PermissionOverwrite(
-            view_channel=True, send_messages=True, attach_files=True,
-            embed_links=True, read_message_history=True,
-        ),
+        member: member_overwrite(),
+        guild.me: member_overwrite(),
     }
     for role_id in (g["staff_role"], g["chef_role"]):
         role = guild.get_role(role_id) if role_id else None
@@ -604,80 +806,147 @@ async def open_ticket(interaction: discord.Interaction, kind: str) -> None:
     try:
         channel = await guild.create_text_channel(
             name=f"{info['prefix']}-{number:04d}-{slugify(member.name)}",
-            category=category,
-            overwrites=overwrites,
+            category=category, overwrites=overwrites,
             topic=f"{info['title']} #{number:04d} • opened by {member} ({member.id})",
             reason=f"{BRAND} ticket opened by {member}",
         )
     except discord.Forbidden:
         return await interaction.followup.send(
-            "❌ I don't have permission to create channels in that category. "
-            "Give my role **Manage Channels** + **Manage Roles** (or Administrator).",
-            ephemeral=True,
-        )
+            "❌ I can't create channels in that category. Give my role **Administrator** "
+            "(or Manage Channels + Manage Roles).", ephemeral=True)
     except discord.HTTPException as exc:
         return await interaction.followup.send(f"❌ Discord error while creating the ticket: {exc}", ephemeral=True)
 
     ticket = {
-        "guild_id": guild.id,
-        "owner_id": member.id,
-        "kind": kind,
-        "number": number,
+        "guild_id": guild.id, "owner_id": member.id, "kind": kind, "number": number,
         "stage": "support" if kind == "support" else "address",
-        "address": None,
-        "total": None,
-        "due": None,
-        "screenshot_msg_id": None,
-        "payment": None,
-        "claimed_by": None,
-        "confirm_msg_id": None,
-        "summary_msg_id": None,
-        "claim_msg_id": None,
-        "completed": False,
-        "created_at": discord.utils.utcnow().isoformat(),
+        "restaurant": None, "address": None, "notes": None,
+        "total": None, "due": None, "screenshot_msg_id": None, "payment": None,
+        "claimed_by": None, "claimed_at": None, "completed": False,
+        "step_msg_id": None, "confirm_msg_id": None, "summary_msg_id": None, "claim_msg_id": None,
+        "opened_at": int(time.time()), "submitted_at": None,
     }
     store.set_ticket(channel.id, ticket)
 
-    await channel.send(
-        content=member.mention,
-        embed=welcome_embed(ticket, g),
-        view=TicketControlView(),
-        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-    )
+    await channel.send(content=member.mention, embed=welcome_embed(ticket, g), view=TicketControlView(),
+                       allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
     if kind != "support":
-        await channel.send(embed=step_address_embed())
+        await send_step(channel, ticket, step_address_embed(), AddressStepView())
 
-    done = discord.Embed(
-        title="✅ Ticket Created",
-        description=f"Your {info['title'].split(' ', 1)[1].lower()} is ready: {channel.mention}",
-        color=COLOR_GREEN,
-    )
+    done = discord.Embed(title="✅ Ticket Created",
+                         description=f"Your ticket is ready: {channel.mention}\nHead over there to continue.",
+                         color=COLOR_GREEN)
     await interaction.followup.send(embed=stamp(done), ephemeral=True)
 
 
-# --------------------------------------------------------------------------
-# Order flow (driven by the ticket owner's messages)
-# --------------------------------------------------------------------------
-async def handle_order_message(message: discord.Message, ticket: dict) -> None:
-    channel = message.channel
-    stage = ticket["stage"]
-    text = message.content.strip()
+# ==========================================================================
+# Order flow
+# ==========================================================================
+async def send_step(channel: discord.TextChannel, ticket: dict, embed: discord.Embed, view: discord.ui.View) -> None:
+    msg = await channel.send(embed=embed, view=view)
+    ticket["step_msg_id"] = msg.id
+    store.set_ticket(channel.id, ticket)
+
+
+async def retire_step(channel: discord.TextChannel, ticket: dict, label: str = "Done") -> None:
+    mid = ticket.get("step_msg_id")
+    ticket["step_msg_id"] = None
+    if mid:
+        try:
+            await channel.get_partial_message(mid).edit(view=DoneView(label))
+        except discord.HTTPException:
+            pass
+
+
+async def apply_address(channel, ticket: dict, restaurant: Optional[str], address: str, notes: Optional[str]) -> None:
+    await retire_step(channel, ticket, "Address received")
+    ticket.update(restaurant=restaurant or None, address=address, notes=notes or None, stage="confirm")
+    msg = await channel.send(embed=step_confirm_embed(ticket), view=AddressConfirmView())
+    ticket["confirm_msg_id"] = msg.id
+    store.set_ticket(channel.id, ticket)
+
+
+async def apply_screenshot_and_total(channel, ticket: dict) -> None:
+    await retire_step(channel, ticket, "Screenshot & total received")
+    total = Decimal(ticket["total"])
+    due = customer_share(total)
+    ticket.update(due=str(due), stage="payment")
+    await send_step(channel, ticket, step_payment_embed(total, due), PayStepView())
+
+
+async def apply_payment(channel, ticket: dict, payment: str) -> None:
+    await retire_step(channel, ticket, "Payment received")
+    ticket.update(payment=payment[:200], stage="submitted", submitted_at=int(time.time()))
+    store.set_ticket(channel.id, ticket)
+    await send_order_summary(channel, ticket)
+
+
+async def submit_address_interaction(interaction, restaurant: str, address: str, notes: str) -> None:
+    channel = interaction.channel
+    async with lock_for(channel.id):
+        ticket = await step_guard(interaction, "address")
+        if not ticket:
+            return
+        await interaction.response.defer()
+        await apply_address(channel, ticket, restaurant, address, notes)
+
+
+async def submit_screenshot_interaction(interaction, uploads: list, total_text: str) -> None:
+    channel = interaction.channel
+    async with lock_for(channel.id):
+        ticket = await step_guard(interaction, "screenshot")
+        if not ticket:
+            return
+        images = [a for a in uploads if is_image(a)]
+        if not images:
+            return await send_error(interaction, "That file isn't an image. Upload a **screenshot** (PNG/JPG).")
+        amount, ambiguous = parse_total(total_text)
+        if amount is None:
+            hint = "Type **just the total**, like `30.00`." if ambiguous else "I couldn't read that total. Type it like `30.00`."
+            return await send_error(interaction, hint)
+        await interaction.response.defer()
+
+        att = images[0]
+        ext = os.path.splitext(att.filename)[1].lower() or ".png"
+        embed = discord.Embed(title="📸 Order Screenshot",
+                              description=f"Uploaded by {interaction.user.mention} • Total entered: **{money(amount)}**",
+                              color=COLOR_BLURPLE)
+        try:
+            file = await att.to_file(filename=f"order_screenshot{ext}")
+            embed.set_image(url=f"attachment://{file.filename}")
+            msg = await channel.send(embed=stamp(embed, "Step 3/4"), file=file)
+        except discord.HTTPException as exc:
+            log.warning("Screenshot re-upload failed: %s", exc)
+            return await interaction.followup.send(
+                embed=note("⚠️ I couldn't save that image (too big?). Try a smaller screenshot.", COLOR_RED),
+                ephemeral=True)
+        ticket.update(screenshot_msg_id=msg.id, total=str(amount))
+        await apply_screenshot_and_total(channel, ticket)
+
+
+async def submit_payment_interaction(interaction, payment: str) -> None:
+    channel = interaction.channel
+    async with lock_for(channel.id):
+        ticket = await step_guard(interaction, "payment")
+        if not ticket:
+            return
+        await interaction.response.defer()
+        await apply_payment(channel, ticket, payment)
+
+
+async def handle_typed_message(message: discord.Message, ticket: dict) -> None:
+    """Typed-answer path (only when the Message Content intent is enabled)."""
+    channel, stage, text = message.channel, ticket["stage"], message.content.strip()
 
     if stage == "address":
         if len(text) < 5:
-            await channel.send(embed=stamp(discord.Embed(
-                description="✍️ Please **type** the restaurant and your full address in one message.",
-                color=COLOR_ORANGE)))
+            await channel.send(embed=note("✍️ Please **type** the restaurant and your full address in one message, "
+                                          "or press **Enter Restaurant & Address** above."))
             return
         if len(text) > 1000:
-            await channel.send(embed=stamp(discord.Embed(
-                description="✂️ That's too long — keep it under 1000 characters.", color=COLOR_ORANGE)))
+            await channel.send(embed=note("✂️ That's too long — keep it under 1000 characters."))
             return
-        ticket["address"] = text
-        ticket["stage"] = "confirm"
-        msg = await channel.send(embed=step_confirm_embed(text), view=AddressConfirmView())
-        ticket["confirm_msg_id"] = msg.id
-        store.set_ticket(channel.id, ticket)
+        await apply_address(channel, ticket, None, text, None)
 
     elif stage == "screenshot":
         images = image_attachments(message)
@@ -688,18 +957,9 @@ async def handle_order_message(message: discord.Message, ticket: dict) -> None:
             ticket["total"] = str(amount)
         store.set_ticket(channel.id, ticket)
 
-        have_shot = ticket["screenshot_msg_id"] is not None
-        have_total = ticket["total"] is not None
-
-        if have_shot and have_total:
-            total = Decimal(ticket["total"])
-            due = customer_share(total)
-            ticket["due"] = str(due)
-            ticket["stage"] = "payment"
-            store.set_ticket(channel.id, ticket)
-            await channel.send(embed=step_payment_embed(total, due))
+        if ticket["screenshot_msg_id"] and ticket["total"]:
+            await apply_screenshot_and_total(channel, ticket)
             return
-
         if not images and amount is None:
             if ambiguous:
                 hint = "I found more than one number. Send **just the total**, like `$30.00`."
@@ -707,30 +967,27 @@ async def handle_order_message(message: discord.Message, ticket: dict) -> None:
                 hint = "I couldn't read an order total from that. Type it like `$30.00`."
             else:
                 hint = "Please attach your **order screenshot** and type the **total**."
-            await channel.send(embed=stamp(discord.Embed(description=f"⚠️ {hint}", color=COLOR_ORANGE), "Step 3/4"))
-            return
-
-        if have_shot and not have_total:
-            desc = "📸 Got your screenshot! Now **type the order total** with tax & delivery (e.g. `$30.00`)."
+            await channel.send(embed=note(f"⚠️ {hint}", extra="Step 3/4"))
+        elif ticket["screenshot_msg_id"]:
+            await channel.send(embed=note("📸 Got your screenshot! Now **type the order total** with tax & delivery "
+                                          "(e.g. `$30.00`).", COLOR_BLURPLE, "Step 3/4"))
         else:
-            desc = f"💲 Got your total (**{money(Decimal(ticket['total']))}**)! Now **send the screenshot** of the order."
-        await channel.send(embed=stamp(discord.Embed(description=desc, color=COLOR_BLURPLE), "Step 3/4"))
+            await channel.send(embed=note(f"💲 Got your total (**{money(Decimal(ticket['total']))}**)! "
+                                          "Now **send the screenshot** of the order.", COLOR_BLURPLE, "Step 3/4"))
 
     elif stage == "payment":
         if not text:
-            await channel.send(embed=stamp(discord.Embed(
-                description="💳 Please **type** your payment method (e.g. Cash App).", color=COLOR_ORANGE)))
+            await channel.send(embed=note("💳 Please **type** your payment method (e.g. Cash App) "
+                                          "or press **Choose Payment** above."))
             return
-        ticket["payment"] = text[:200]
-        ticket["stage"] = "submitted"
-        store.set_ticket(channel.id, ticket)
-        await send_order_summary(channel, ticket)
+        await apply_payment(channel, ticket, f"💳 {text}")
 
 
 async def send_order_summary(channel: discord.TextChannel, ticket: dict) -> None:
     g = store.guild(channel.guild.id)
     ping_role = g["chef_role"] or g["staff_role"]
-    content = f"{role_mention(ping_role)} 🔔 **New order ready to be claimed!**" if ping_role else "🔔 **New order ready to be claimed!**"
+    head = "🔔 **New order ready to be claimed!**" + (" ⭐ **VIP**" if ticket["kind"] == "vip" else "")
+    content = f"{role_mention(ping_role)} {head}" if ping_role else head
     allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
 
     file: Optional[discord.File] = None
@@ -744,15 +1001,15 @@ async def send_order_summary(channel: discord.TextChannel, ticket: dict) -> None
             ext = os.path.splitext(att.filename)[1].lower() or ".png"
             file = await att.to_file(filename=f"order_screenshot{ext}")
     except discord.HTTPException as exc:
-        print(f"[summary] could not fetch screenshot in {channel.id}: {exc}")
+        log.warning("Could not fetch screenshot in %s: %s", channel.id, exc)
 
-    embed = summary_embed(ticket, status_waiting(), file.filename if file else None)
     msg = None
     if file:
         try:
-            msg = await channel.send(content=content, embed=embed, file=file, view=ClaimView(), allowed_mentions=allowed)
+            msg = await channel.send(content=content, embed=summary_embed(ticket, status_waiting(), file.filename),
+                                     file=file, view=ClaimView(), allowed_mentions=allowed)
         except discord.HTTPException as exc:
-            print(f"[summary] re-upload failed ({exc}); sending link instead")
+            log.warning("Summary re-upload failed (%s); sending link instead", exc)
     if msg is None:
         embed = summary_embed(ticket, status_waiting(), None)
         embed.add_field(name="📸 Screenshot",
@@ -761,43 +1018,40 @@ async def send_order_summary(channel: discord.TextChannel, ticket: dict) -> None
 
     ticket["summary_msg_id"] = msg.id
     store.set_ticket(channel.id, ticket)
+    await channel.send(embed=note(
+        f"✅ {mention(ticket['owner_id'])} your order was sent to the kitchen!\n"
+        f"Send **{money(Decimal(ticket['due']))}** with **{payment_text(ticket)}** when a chef claims it.",
+        COLOR_GREEN, f"Order #{ticket['number']:04d}"))
 
 
 async def answer_address(interaction: discord.Interaction, correct: bool) -> None:
     channel = interaction.channel
     async with lock_for(channel.id):
-        ticket = store.ticket(channel.id)
-        if ticket is None:
-            return await send_error(interaction, "This ticket no longer exists.")
-        if interaction.user.id != ticket["owner_id"] and not is_admin(interaction.user):
-            return await send_error(interaction, "Only the person who opened this ticket can answer this.")
-        if ticket["stage"] != "confirm" or interaction.message.id != ticket["confirm_msg_id"]:
+        ticket = await step_guard(interaction, "confirm")
+        if not ticket:
+            return
+        if interaction.message.id != ticket["confirm_msg_id"]:
             return await send_error(interaction, "This question was already answered.")
 
-        verdict = "✅ Confirmed" if correct else "❌ Rejected — retyping"
-        old = interaction.message.embeds[0] if interaction.message.embeds else step_confirm_embed(ticket["address"])
-        old.color = COLOR_GREEN if correct else COLOR_RED
-        old.set_field_at(len(old.fields) - 1, name="📌 Answer", value=verdict, inline=False)
-        await interaction.response.edit_message(embed=old, view=AddressConfirmView(disabled=True))
+        embed = step_confirm_embed(ticket)
+        embed.color = COLOR_GREEN if correct else COLOR_RED
+        embed.set_field_at(len(embed.fields) - 1, name="📌 Answer",
+                           value="✅ Confirmed" if correct else "❌ Rejected — retyping", inline=False)
+        await interaction.response.edit_message(embed=embed, view=AddressConfirmView(disabled=True))
+        ticket["confirm_msg_id"] = None
 
         if correct:
-            ticket["stage"] = "screenshot"
-            ticket["screenshot_msg_id"] = None
-            ticket["total"] = None
-            store.set_ticket(channel.id, ticket)
-            await channel.send(embed=step_screenshot_embed())
+            ticket.update(stage="screenshot", screenshot_msg_id=None, total=None)
+            await send_step(channel, ticket, step_screenshot_embed(), ShotStepView())
         else:
-            ticket["stage"] = "address"
-            ticket["address"] = None
-            ticket["confirm_msg_id"] = None
-            store.set_ticket(channel.id, ticket)
-            await channel.send(embed=step_address_embed(retry=True))
+            ticket.update(stage="address", restaurant=None, address=None, notes=None)
+            await send_step(channel, ticket, step_address_embed(retry=True), AddressStepView())
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Claim / Unclaim / Complete / Close
-# --------------------------------------------------------------------------
-async def update_summary(channel: discord.TextChannel, ticket: dict, status: str, view: discord.ui.View) -> None:
+# ==========================================================================
+async def update_summary(channel, ticket: dict, status: str, view: discord.ui.View) -> None:
     if not ticket.get("summary_msg_id"):
         return
     try:
@@ -811,16 +1065,15 @@ async def update_summary(channel: discord.TextChannel, ticket: dict, status: str
                 break
         await msg.edit(embed=embed, view=view)
     except discord.HTTPException as exc:
-        print(f"[summary] update failed in {channel.id}: {exc}")
+        log.warning("Summary update failed in %s: %s", channel.id, exc)
 
 
-async def disable_claim_message(channel: discord.TextChannel, ticket: dict) -> None:
-    if not ticket.get("claim_msg_id"):
-        return
-    try:
-        await channel.get_partial_message(ticket["claim_msg_id"]).edit(view=ClaimedView(disabled=True))
-    except discord.HTTPException:
-        pass
+async def disable_claim_message(channel, ticket: dict) -> None:
+    if ticket.get("claim_msg_id"):
+        try:
+            await channel.get_partial_message(ticket["claim_msg_id"]).edit(view=ClaimedView(disabled=True))
+        except discord.HTTPException:
+            pass
     ticket["claim_msg_id"] = None
 
 
@@ -831,7 +1084,7 @@ async def do_claim(interaction: discord.Interaction) -> None:
             ticket = get_ticket_or_fail(channel)
             g = store.guild(channel.guild.id)
             if not is_staff(member, g):
-                raise TicketError(f"Only {role_mention(g['chef_role'] or g['staff_role'])} or admins can claim orders.")
+                raise TicketError(f"Only {role_mention(g['chef_role'] or g['staff_role'])} or the owner can claim orders.")
             if ticket["completed"]:
                 raise TicketError("This order is already completed.")
             if ticket["claimed_by"]:
@@ -842,42 +1095,34 @@ async def do_claim(interaction: discord.Interaction) -> None:
             return await send_error(interaction, str(exc))
 
         await ack(interaction)
-
-        # Lock the channel: only owner, claimer and admins can type.
         for role_id in (g["staff_role"], g["chef_role"]):
             role = channel.guild.get_role(role_id) if role_id else None
             if role:
                 await channel.set_permissions(role, overwrite=staff_overwrite(False), reason=f"Claimed by {member}")
         if member.id != ticket["owner_id"]:
-            await channel.set_permissions(
-                member,
-                overwrite=discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True, attach_files=True,
-                    embed_links=True, read_message_history=True),
-                reason=f"Claimed by {member}",
-            )
+            await channel.set_permissions(member, overwrite=member_overwrite(), reason=f"Claimed by {member}")
 
-        ticket["claimed_by"] = member.id
+        ticket.update(claimed_by=member.id, claimed_at=int(time.time()))
         await update_summary(channel, ticket, status_claimed(member.id), ClaimView(claimed=True))
 
         embed = discord.Embed(
             title="🙋 Order Claimed",
-            description=(
-                f"{member.mention} has claimed this order and is working on it now! 🧑‍🍳\n\n"
-                f"🔐 Only {mention(ticket['owner_id'])}, {member.mention} and **administrators** can type here."
-            ),
+            description=(f"{member.mention} has claimed this order and is working on it now! 🧑‍🍳\n\n"
+                         f"🔐 Only {mention(ticket['owner_id'])}, {member.mention} and **administrators** can type here."),
             color=COLOR_BLUE,
         )
         embed.add_field(name="👤 Customer", value=mention(ticket["owner_id"]), inline=True)
         embed.add_field(name="🧑‍🍳 Chef", value=member.mention, inline=True)
         if ticket.get("due"):
             embed.add_field(name="💵 Amount Due", value=money(Decimal(ticket["due"])), inline=True)
-        embed.add_field(
-            name="🛠️ Controls",
-            value="**↩️ Unclaim** — give the order back\n**✅ Mark Complete** — finish the order (or `/complete`)",
-            inline=False,
-        )
-        msg = await channel.send(embed=stamp(embed, f"Ticket #{ticket['number']:04d}"), view=ClaimedView())
+            embed.add_field(name="💳 Payment", value=payment_text(ticket), inline=True)
+        embed.add_field(name="🕒 Claimed", value=ts(ticket["claimed_at"]), inline=True)
+        embed.add_field(name="🛠️ Chef Controls",
+                        value="**↩️ Unclaim** — give the order back\n**✅ Mark Complete** — finish the order (or `/complete`)",
+                        inline=False)
+        msg = await channel.send(content=mention(ticket["owner_id"]), embed=stamp(embed, f"Order #{ticket['number']:04d}"),
+                                 view=ClaimedView(),
+                                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
         ticket["claim_msg_id"] = msg.id
         store.set_ticket(channel.id, ticket)
         await finish(interaction, "✅ You claimed this order.")
@@ -893,25 +1138,25 @@ async def do_unclaim(interaction: discord.Interaction) -> None:
                 raise TicketError("This order isn't claimed.")
             if ticket["completed"]:
                 raise TicketError("This order is already completed.")
-            if member.id != ticket["claimed_by"] and not is_admin(member):
-                raise TicketError(f"Only {mention(ticket['claimed_by'])} or an administrator can unclaim this.")
+            if member.id != ticket["claimed_by"] and not is_owner(member):
+                raise TicketError(f"Only {mention(ticket['claimed_by'])} or the owner can unclaim this.")
         except TicketError as exc:
             return await send_error(interaction, str(exc))
 
         await ack(interaction)
         previous = ticket["claimed_by"]
-
         for role_id in (g["staff_role"], g["chef_role"]):
             role = channel.guild.get_role(role_id) if role_id else None
             if role:
                 await channel.set_permissions(role, overwrite=staff_overwrite(True), reason=f"Unclaimed by {member}")
         if previous != ticket["owner_id"]:
             try:  # raw call works even if the member isn't cached
-                await bot.http.delete_channel_permissions(channel.id, previous, reason=f"Unclaimed by {member}")
+                await interaction.client.http.delete_channel_permissions(channel.id, previous,
+                                                                         reason=f"Unclaimed by {member}")
             except discord.HTTPException:
                 pass
 
-        ticket["claimed_by"] = None
+        ticket.update(claimed_by=None, claimed_at=None)
         await disable_claim_message(channel, ticket)
         await update_summary(channel, ticket, status_waiting(), ClaimView())
         store.set_ticket(channel.id, ticket)
@@ -919,17 +1164,14 @@ async def do_unclaim(interaction: discord.Interaction) -> None:
         ping_role = g["chef_role"] or g["staff_role"]
         embed = discord.Embed(
             title="↩️ Order Unclaimed",
-            description=(
-                f"{member.mention} unclaimed this order (was {mention(previous)}).\n\n"
-                "🔓 Staff can type here again — the order is **back up for grabs**. Press **Claim Order** above."
-            ),
+            description=(f"{member.mention} unclaimed this order (was {mention(previous)}).\n\n"
+                         "🔓 Staff can type here again — the order is **back up for grabs**. "
+                         "Press **Claim Order** on the order above."),
             color=COLOR_ORANGE,
         )
-        await channel.send(
-            content=role_mention(ping_role) if ping_role else None,
-            embed=stamp(embed, f"Ticket #{ticket['number']:04d}"),
-            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
-        )
+        await channel.send(content=role_mention(ping_role) if ping_role else None,
+                           embed=stamp(embed, f"Order #{ticket['number']:04d}"),
+                           allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
         await finish(interaction, "✅ Order unclaimed.")
 
 
@@ -942,78 +1184,93 @@ async def do_complete(interaction: discord.Interaction) -> None:
                 raise TicketError("This order is already marked complete.")
             if not ticket["claimed_by"]:
                 raise TicketError("Claim the order first (press **Claim Order** or use `/claim`).")
-            if member.id != ticket["claimed_by"] and not is_admin(member):
-                raise TicketError(f"Only {mention(ticket['claimed_by'])} or an administrator can complete this.")
+            if member.id != ticket["claimed_by"] and not is_owner(member):
+                raise TicketError(f"Only {mention(ticket['claimed_by'])} or the owner can complete this.")
         except TicketError as exc:
             return await send_error(interaction, str(exc))
 
         await ack(interaction)
+        guild = channel.guild
+        g = store.guild(guild.id)
         chef = ticket["claimed_by"]
-        ticket["completed"] = True
-        ticket["stage"] = "completed"
+        ticket.update(completed=True, stage="completed")
         await disable_claim_message(channel, ticket)
         await update_summary(channel, ticket, status_done(chef), ClaimView(done=True))
         store.set_ticket(channel.id, ticket)
 
+        s = store.stats(guild.id, chef)
+        s["orders"] += 1
+        if ticket.get("due"):
+            s["revenue"] = str(Decimal(s["revenue"]) + Decimal(ticket["due"]))
+        g["orders_completed"] += 1
+        store.save()
+
+        took = int(time.time()) - (ticket.get("claimed_at") or int(time.time()))
         embed = discord.Embed(
             title="✅ Order Complete",
-            description=(
-                f"This order from {mention(ticket['owner_id'])} has been done by {mention(chef)}. 🎉\n\n"
-                f"Thanks for ordering with **{BRAND}**! Press **Close Ticket** when you're finished."
-            ),
+            description=(f"This order from {mention(ticket['owner_id'])} has been done by {mention(chef)}. 🎉\n\n"
+                         f"Thanks for ordering with **{BRAND}**! Press **Close Ticket** when you're finished."),
             color=COLOR_GREEN,
         )
         embed.add_field(name="👤 Customer", value=mention(ticket["owner_id"]), inline=True)
         embed.add_field(name="🧑‍🍳 Done by", value=mention(chef), inline=True)
-        embed.add_field(name="🎫 Ticket", value=f"#{ticket['number']:04d}", inline=True)
+        embed.add_field(name="🆔 Order", value=f"#{ticket['number']:04d}", inline=True)
         if ticket.get("total"):
             embed.add_field(name="🧾 Order Total", value=money(Decimal(ticket["total"])), inline=True)
             embed.add_field(name="💵 Paid", value=money(Decimal(ticket["due"])), inline=True)
-            embed.add_field(name="💳 Payment", value=ticket["payment"] or "—", inline=True)
-        stamp(embed, f"Ticket #{ticket['number']:04d}")
+            embed.add_field(name="💳 Payment", value=payment_text(ticket), inline=True)
+        embed.add_field(name="⏱️ Time to complete", value=duration(took), inline=True)
+        embed.add_field(name="🏆 Chef's orders", value=str(s["orders"]), inline=True)
+        stamp(embed, f"Order #{ticket['number']:04d}")
         await channel.send(content=mention(ticket["owner_id"]), embed=embed, view=TicketControlView(),
                            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
-        log = await get_log_channel(channel.guild)
-        if log:
+        # receipt DM to the customer (ignored if their DMs are closed)
+        try:
+            customer = guild.get_member(ticket["owner_id"]) or await interaction.client.fetch_user(ticket["owner_id"])
+            receipt = embed.copy()
+            receipt.title = f"🧾 Your {BRAND} receipt"
+            receipt.description = f"Your order in **{guild.name}** has been done by {mention(chef)}. Enjoy! 🍽️"
+            await customer.send(embed=receipt)
+        except (discord.HTTPException, AttributeError):
+            pass
+
+        logch = get_log_channel(guild)
+        if logch:
             log_embed = embed.copy()
             log_embed.title = "📦 Order Completed"
-            log_embed.description = (
-                f"This order from {mention(ticket['owner_id'])} has been done by {mention(chef)}.\n"
-                f"Channel: {channel.mention}"
-            )
+            log_embed.description = (f"This order from {mention(ticket['owner_id'])} has been done by {mention(chef)}.\n"
+                                     f"Channel: {channel.mention}")
             try:
-                await log.send(embed=log_embed, allowed_mentions=discord.AllowedMentions.none())
+                await logch.send(embed=log_embed, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 pass
+        await refresh_panels(guild)
         await finish(interaction, "✅ Order marked complete.")
 
 
 def check_can_close(member: discord.Member, ticket: dict) -> None:
     g = store.guild(ticket["guild_id"])
     if member.id != ticket["owner_id"] and not is_staff(member, g):
-        raise TicketError("Only the ticket owner, staff or administrators can close this ticket.")
+        raise TicketError("Only the customer, chefs or the owner can close this ticket.")
 
 
-async def get_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+def get_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     g = store.guild(guild.id)
     ch = guild.get_channel(g["log_channel"]) if g["log_channel"] else None
     return ch if isinstance(ch, discord.TextChannel) else None
 
 
 async def build_transcript(channel: discord.TextChannel) -> discord.File:
-    lines = [f"{BRAND} transcript — #{channel.name} ({channel.id})", "=" * 60]
+    lines = [f"{BRAND} transcript - #{channel.name} ({channel.id})", "=" * 60]
     async for m in channel.history(limit=5000, oldest_first=True):
         parts = [m.content] if m.content else []
         for e in m.embeds:
             parts.append(f"[embed: {e.title or ''} | {(e.description or '').strip()}]")
-            for f in e.fields:
-                parts.append(f"  {f.name}: {f.value}")
-        for a in m.attachments:
-            parts.append(f"[attachment: {a.filename} {a.url}]")
+            parts.extend(f"  {f.name}: {f.value}" for f in e.fields)
+        parts.extend(f"[attachment: {a.filename} {a.url}]" for a in m.attachments)
         lines.append(f"[{m.created_at:%Y-%m-%d %H:%M:%S} UTC] {m.author} ({m.author.id}): " + "\n".join(parts))
-    data = "\n".join(lines).encode("utf-8")
-    return discord.File(io.BytesIO(data), filename=f"transcript-{channel.name}.txt")
+    return discord.File(io.BytesIO("\n".join(lines).encode("utf-8")), filename=f"transcript-{channel.name}.txt")
 
 
 async def close_ticket(channel: discord.TextChannel, closer: discord.Member, reason: str) -> None:
@@ -1024,29 +1281,28 @@ async def close_ticket(channel: discord.TextChannel, closer: discord.Member, rea
     ticket["closing"] = True
     store.set_ticket(channel.id, ticket)
 
-    embed = discord.Embed(
-        title="🔒 Ticket Closing",
-        description=f"Closed by {closer.mention}. This channel will be deleted in **{CLOSE_DELAY_SECONDS} seconds**.",
-        color=COLOR_RED,
-    )
+    embed = discord.Embed(title="🔒 Ticket Closing",
+                          description=f"Closed by {closer.mention}. This channel will be deleted in **{CLOSE_DELAY_SECONDS} seconds**.",
+                          color=COLOR_RED)
     embed.add_field(name="📝 Reason", value=reason[:1024], inline=False)
     await channel.send(embed=stamp(embed))
 
-    log = await get_log_channel(channel.guild)
-    if log:
-        log_embed = discord.Embed(title="🔒 Ticket Closed", color=COLOR_RED)
-        log_embed.add_field(name="🎫 Ticket", value=f"#{ticket['number']:04d} • `{channel.name}`", inline=True)
-        log_embed.add_field(name="📂 Type", value=ticket["kind"].upper(), inline=True)
-        log_embed.add_field(name="👤 Opened by", value=mention(ticket["owner_id"]), inline=True)
-        log_embed.add_field(name="🔒 Closed by", value=closer.mention, inline=True)
-        log_embed.add_field(name="🧑‍🍳 Claimed by", value=mention(ticket["claimed_by"]), inline=True)
-        log_embed.add_field(name="✅ Completed", value="Yes" if ticket["completed"] else "No", inline=True)
-        log_embed.add_field(name="📝 Reason", value=reason[:1024], inline=False)
+    logch = get_log_channel(channel.guild)
+    if logch:
+        le = discord.Embed(title="🔒 Ticket Closed", color=COLOR_RED)
+        le.add_field(name="🎫 Ticket", value=f"#{ticket['number']:04d} • `{channel.name}`", inline=True)
+        le.add_field(name="📂 Type", value=ticket["kind"].upper(), inline=True)
+        le.add_field(name="👤 Opened by", value=mention(ticket["owner_id"]), inline=True)
+        le.add_field(name="🔒 Closed by", value=closer.mention, inline=True)
+        le.add_field(name="🧑‍🍳 Claimed by", value=mention(ticket["claimed_by"]), inline=True)
+        le.add_field(name="✅ Completed", value="Yes" if ticket["completed"] else "No", inline=True)
+        le.add_field(name="🕒 Opened", value=ts(ticket["opened_at"], "f"), inline=True)
+        le.add_field(name="📝 Reason", value=reason[:1024], inline=False)
         try:
-            transcript = await build_transcript(channel)
-            await log.send(embed=stamp(log_embed), file=transcript, allowed_mentions=discord.AllowedMentions.none())
+            await logch.send(embed=stamp(le), file=await build_transcript(channel),
+                             allowed_mentions=discord.AllowedMentions.none())
         except discord.HTTPException as exc:
-            print(f"[close] transcript/log failed: {exc}")
+            log.warning("Transcript/log failed: %s", exc)
 
     await asyncio.sleep(CLOSE_DELAY_SECONDS)
     store.delete_ticket(channel.id)
@@ -1056,134 +1312,63 @@ async def close_ticket(channel: discord.TextChannel, closer: discord.Member, rea
     except discord.NotFound:
         pass
     except discord.HTTPException as exc:
-        print(f"[close] could not delete {channel.id}: {exc}")
+        log.warning("Could not delete %s: %s", channel.id, exc)
 
 
-# --------------------------------------------------------------------------
-# Bot
-# --------------------------------------------------------------------------
-class MunchiesBot(discord.Client):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+# ==========================================================================
+# Command tree: only owners/admins and chefs may use slash commands
+# ==========================================================================
+class GatedTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await send_error(interaction, "Commands only work inside a server.")
+            return False
+        g = store.guild(interaction.guild.id)
+        if can_use_commands(interaction.user, g):
+            return True
+        await send_error(interaction, f"🔒 Commands are only for the **server owner** and "
+                                      f"{role_mention(g['chef_role'])}.")
+        return False
 
-    async def setup_hook(self) -> None:
-        for view in (PanelView(), TicketControlView(), AddressConfirmView(), ClaimView(), ClaimedView()):
-            self.add_view(view)
-
-    async def sync_guild(self, guild: discord.Guild) -> None:
-        self.tree.copy_global_to(guild=guild)
-        try:
-            cmds = await self.tree.sync(guild=guild)
-            print(f"[sync] {guild.name}: {len(cmds)} commands")
-        except discord.HTTPException as exc:
-            print(f"[sync] {guild.name} failed: {exc}")
-
-
-bot = MunchiesBot()
-tree = bot.tree
-
-
-@bot.event
-async def on_ready():
-    print(f"[ready] logged in as {bot.user} ({bot.user.id})")
-    invite = discord.utils.oauth_url(
-        bot.user.id,
-        permissions=discord.Permissions(administrator=True),
-        scopes=("bot", "applications.commands"),
-    )
-    print(f"[ready] invite link: {invite}")
-    for guild in bot.guilds:
-        await bot.sync_guild(guild)
-    # drop tickets whose channels were deleted while the bot was offline
-    stale = [cid for cid, t in store.tickets().items()
-             if (gd := bot.get_guild(t["guild_id"])) is not None and gd.get_channel(int(cid)) is None]
-    for cid in stale:
-        store.delete_ticket(int(cid))
-    for t in store.tickets().values():
-        t.pop("closing", None)  # a close interrupted by a restart must not block closing again
-    store.save()
-    for guild in bot.guilds:
-        await refresh_panels(guild)
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="🍽️ orders"))
-    print("[ready] Munchies Order Desk is online ✅")
+    async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            msg = "Only the **server owner / administrators** can use this command."
+        elif isinstance(error, app_commands.CommandInvokeError) and isinstance(error.original, discord.Forbidden):
+            msg = "I'm missing permissions for that. Give my role **Administrator**."
+        else:
+            msg = f"Something went wrong: `{error}`"
+            log.error("Command error", exc_info=error)
+        await send_error(interaction, msg)
 
 
-@bot.event
-async def on_guild_join(guild: discord.Guild):
-    await bot.sync_guild(guild)
+def owner_only():
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if not is_owner(interaction.user):
+            raise app_commands.MissingPermissions(["administrator"])
+        return True
+    return app_commands.check(predicate)
 
 
-@bot.event
-async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
-    store.delete_ticket(channel.id)
-    channel_locks.pop(channel.id, None)
-
-
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or message.guild is None:
-        return
-    ticket = store.ticket(message.channel.id)
-    if ticket is None or message.author.id != ticket["owner_id"]:
-        return
-    if ticket["stage"] not in ("address", "screenshot", "payment"):
-        return
-    async with lock_for(message.channel.id):
-        ticket = store.ticket(message.channel.id)
-        if ticket is None:
-            return
-        try:
-            await handle_order_message(message, ticket)
-        except discord.HTTPException as exc:
-            print(f"[order] error in {message.channel.id}: {exc}")
-
-
-@tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        msg = "You need **Administrator** to use this command."
-    elif isinstance(error, app_commands.NoPrivateMessage):
-        msg = "This command only works inside a server."
-    elif isinstance(error, app_commands.CommandInvokeError) and isinstance(error.original, discord.Forbidden):
-        msg = "I'm missing permissions for that. Give my role **Administrator** (or Manage Channels + Manage Roles)."
-    else:
-        msg = f"Something went wrong: `{error}`"
-        print(f"[command error] {error!r}")
-    await send_error(interaction, msg)
-
-
-# ---- Setup commands ------------------------------------------------------
-@tree.command(name="ticket", description="Set up the Munchies ticket system and post the Order Desk panel")
+# ---- Setup (owner only) --------------------------------------------------
+@app_commands.command(name="ticket", description="Set up the Munchies ticket system and post the Order Desk panel")
 @app_commands.describe(
     staff_role="Role that gets added to every ticket",
     category="Category the tickets will be created in",
-    chef_role="Role that gets pinged for new orders (optional, can set later with /setchef)",
+    chef_role="Role that gets pinged for new orders and can use commands",
     log_channel="Channel for transcripts & completed orders (optional)",
     vip_role="Only this role can open VIP tickets (optional)",
     panel_channel="Where to post the panel (defaults to this channel)",
 )
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def ticket_cmd(
-    interaction: discord.Interaction,
-    staff_role: discord.Role,
-    category: discord.CategoryChannel,
-    chef_role: Optional[discord.Role] = None,
-    log_channel: Optional[discord.TextChannel] = None,
-    vip_role: Optional[discord.Role] = None,
-    panel_channel: Optional[discord.TextChannel] = None,
-):
+@owner_only()
+async def ticket_cmd(interaction: discord.Interaction, staff_role: discord.Role, category: discord.CategoryChannel,
+                     chef_role: Optional[discord.Role] = None, log_channel: Optional[discord.TextChannel] = None,
+                     vip_role: Optional[discord.Role] = None, panel_channel: Optional[discord.TextChannel] = None):
     target = panel_channel or interaction.channel
     if not isinstance(target, discord.TextChannel):
         return await send_error(interaction, "Run this in a normal text channel or pick `panel_channel`.")
-
     g = store.guild(interaction.guild.id)
-    g["staff_role"] = staff_role.id
-    g["category"] = category.id
+    g["staff_role"], g["category"] = staff_role.id, category.id
     if chef_role:
         g["chef_role"] = chef_role.id
     if log_channel:
@@ -1191,9 +1376,8 @@ async def ticket_cmd(
     if vip_role:
         g["vip_role"] = vip_role.id
     store.save()
-
     try:
-        panel = await target.send(embed=panel_embed(g), view=PanelView())
+        panel = await target.send(embed=panel_embed(interaction.guild, g), view=PanelView())
     except discord.HTTPException as exc:
         return await send_error(interaction, f"I couldn't post the panel in {target.mention}: {exc}")
     g["panels"].append([target.id, panel.id])
@@ -1205,35 +1389,33 @@ async def ticket_cmd(
     embed.add_field(name="⭐ VIP Role", value=role_mention(g["vip_role"]) if g["vip_role"] else "*anyone*", inline=True)
     embed.add_field(name="📂 Category", value=category.mention, inline=True)
     embed.add_field(name="📜 Logs", value=f"<#{g['log_channel']}>" if g["log_channel"] else "*not set*", inline=True)
+    embed.add_field(name="✍️ Typed answers", value="On" if TYPED_INPUT else "Off (forms only)", inline=True)
     if not g["chef_role"]:
-        embed.add_field(name="💡 Tip", value="Use `/setchef` so chefs get pinged on new orders.", inline=False)
+        embed.add_field(name="💡 Tip", value="Use `/setchef` so chefs get pinged and can use commands.", inline=False)
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
-@tree.command(name="setchef", description="Set the chef role that gets pinged for new orders")
+@app_commands.command(name="setchef", description="Set the chef role (pinged for orders, can use commands)")
 @app_commands.describe(role="The chef role")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@owner_only()
 async def setchef_cmd(interaction: discord.Interaction, role: discord.Role):
     g = store.guild(interaction.guild.id)
     g["chef_role"] = role.id
     store.save()
     embed = discord.Embed(
         title="🧑‍🍳 Chef Role Set",
-        description=(
-            f"{role.mention} will be pinged for every new order and can **claim**, **unclaim** and **complete** orders.\n\n"
-            "⚠️ If the role isn't mentionable, give my role **Mention @everyone, @here and All Roles** so the ping works."
-        ),
+        description=(f"{role.mention} will be pinged for every new order and can use the bot's commands "
+                     "(**claim**, **unclaim**, **complete**, **close**, **clockin** …).\n\n"
+                     "⚠️ If the role isn't mentionable, give my role **Mention @everyone, @here and All Roles**."),
         color=COLOR_GREEN,
     )
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
-@tree.command(name="setlogs", description="Set the channel for ticket transcripts and completed orders")
+@app_commands.command(name="setlogs", description="Set the channel for transcripts and completed orders")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@owner_only()
 async def setlogs_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
     g = store.guild(interaction.guild.id)
     g["log_channel"] = channel.id
@@ -1243,95 +1425,125 @@ async def setlogs_cmd(interaction: discord.Interaction, channel: discord.TextCha
         ephemeral=True)
 
 
-@tree.command(name="panel", description="Re-post the Order Desk panel in this channel")
+@app_commands.command(name="panel", description="Re-post the Order Desk panel in this channel")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
+@owner_only()
 async def panel_cmd(interaction: discord.Interaction):
     g = store.guild(interaction.guild.id)
     if not g["category"]:
         return await send_error(interaction, "Run `/ticket` first.")
     if not isinstance(interaction.channel, discord.TextChannel):
         return await send_error(interaction, "Run this in a normal text channel.")
-    msg = await interaction.channel.send(embed=panel_embed(g), view=PanelView())
+    msg = await interaction.channel.send(embed=panel_embed(interaction.guild, g), view=PanelView())
     g["panels"].append([interaction.channel.id, msg.id])
     store.save()
     await interaction.response.send_message("✅ Panel posted.", ephemeral=True)
 
 
-# ---- Staff clock in/out -------------------------------------------------
-@tree.command(name="clockin", description="Clock in — you'll show under Staff Online")
+# ---- Clock in / out --------------------------------------------------------
+@app_commands.command(name="clockin", description="Clock in — you'll show under Staff Online")
 @app_commands.guild_only()
 async def clockin_cmd(interaction: discord.Interaction):
     g = store.guild(interaction.guild.id)
-    if not is_staff(interaction.user, g):
-        return await send_error(interaction, "Only staff, chefs or administrators can clock in.")
-    if interaction.user.id in g["clocked_in"]:
-        return await send_error(interaction, "You're already clocked in. Use `/clockout` when you're done.")
-    g["clocked_in"].append(interaction.user.id)
+    uid = str(interaction.user.id)
+    if uid in g["clocked_in"]:
+        return await send_error(interaction, f"You're already clocked in (since {ts(g['clocked_in'][uid])}). "
+                                             "Use `/clockout` when you're done.")
+    g["clocked_in"][uid] = int(time.time())
     store.save()
     await interaction.response.defer(ephemeral=True, thinking=True)
     await refresh_panels(interaction.guild)
-    embed = discord.Embed(
-        title="🟢 Clocked In",
-        description=f"{interaction.user.mention} you're now listed under **Staff Online**. Let's cook! 🍳",
-        color=COLOR_GREEN,
-    )
+    embed = discord.Embed(title="🟢 Clocked In",
+                          description=f"{interaction.user.mention} you're now listed under **Staff Online**. Let's cook! 🍳",
+                          color=COLOR_GREEN)
+    embed.add_field(name="🕒 Started", value=ts(g["clocked_in"][uid], "t"), inline=True)
     embed.add_field(name="👥 Staff Online", value=str(len(g["clocked_in"])), inline=True)
     await interaction.followup.send(embed=stamp(embed), ephemeral=True)
 
 
-@tree.command(name="clockout", description="Clock out — you'll be removed from Staff Online")
+@app_commands.command(name="clockout", description="Clock out — you'll be removed from Staff Online")
 @app_commands.guild_only()
 async def clockout_cmd(interaction: discord.Interaction):
     g = store.guild(interaction.guild.id)
-    if interaction.user.id not in g["clocked_in"]:
+    uid = str(interaction.user.id)
+    if uid not in g["clocked_in"]:
         return await send_error(interaction, "You aren't clocked in.")
-    g["clocked_in"].remove(interaction.user.id)
+    worked = int(time.time()) - g["clocked_in"].pop(uid)
+    s = store.stats(interaction.guild.id, interaction.user.id)
+    s["seconds"] += worked
     store.save()
     await interaction.response.defer(ephemeral=True, thinking=True)
     await refresh_panels(interaction.guild)
-    embed = discord.Embed(
-        title="🔴 Clocked Out",
-        description=f"{interaction.user.mention} you've been removed from **Staff Online**. Good work! 👋",
-        color=COLOR_RED,
-    )
+    embed = discord.Embed(title="🔴 Clocked Out",
+                          description=f"{interaction.user.mention} you've been removed from **Staff Online**. Good work! 👋",
+                          color=COLOR_RED)
+    embed.add_field(name="⏱️ This shift", value=duration(worked), inline=True)
+    embed.add_field(name="📊 All-time", value=duration(s["seconds"]), inline=True)
     await interaction.followup.send(embed=stamp(embed), ephemeral=True)
 
 
-@tree.command(name="staffonline", description="See who is clocked in")
+@app_commands.command(name="staffonline", description="See who is clocked in")
 @app_commands.guild_only()
 async def staffonline_cmd(interaction: discord.Interaction):
     g = store.guild(interaction.guild.id)
     online = g["clocked_in"]
     embed = discord.Embed(
-        title="🟢 Staff Online",
-        description="\n".join(mention(u) for u in online) if online else "*No staff clocked in right now*",
-        color=COLOR_GREEN,
-    )
+        title=f"🟢 Staff Online ({len(online)})",
+        description="\n".join(f"{mention(u)} — since {ts(t)}" for u, t in online.items()) or "*No staff clocked in*",
+        color=COLOR_GREEN)
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
-# ---- Ticket commands ----------------------------------------------------
-@tree.command(name="claim", description="Claim the order in this ticket")
+@app_commands.command(name="stats", description="Show a chef's stats")
+@app_commands.guild_only()
+async def stats_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    member = member or interaction.user
+    g = store.guild(interaction.guild.id)
+    s = store.stats(interaction.guild.id, member.id)
+    since = g["clocked_in"].get(str(member.id))
+    embed = discord.Embed(title=f"📊 Stats — {member.display_name}", color=COLOR_BLURPLE)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="📦 Orders completed", value=str(s["orders"]), inline=True)
+    embed.add_field(name="💵 Payments handled", value=money(Decimal(s["revenue"])), inline=True)
+    embed.add_field(name="⏱️ Time clocked", value=duration(s["seconds"] + (time.time() - since if since else 0)), inline=True)
+    embed.add_field(name="🟢 Status", value=f"Clocked in {ts(since)}" if since else "🔴 Clocked out", inline=False)
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+
+@app_commands.command(name="leaderboard", description="Top chefs by completed orders")
+@app_commands.guild_only()
+async def leaderboard_cmd(interaction: discord.Interaction):
+    g = store.guild(interaction.guild.id)
+    top = sorted(g["stats"].items(), key=lambda kv: kv[1].get("orders", 0), reverse=True)[:10]
+    medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
+    lines = [f"{medals[i]} {mention(uid)} — **{s.get('orders', 0)}** orders • {money(Decimal(s.get('revenue', '0')))}"
+             for i, (uid, s) in enumerate(top) if s.get("orders", 0)]
+    embed = discord.Embed(title="🏆 Chef Leaderboard", description="\n".join(lines) or "*No completed orders yet*",
+                          color=COLOR_GOLD)
+    embed.add_field(name="📦 Total orders", value=str(g["orders_completed"]), inline=True)
+    await interaction.response.send_message(embed=stamp(embed))
+
+
+# ---- Ticket commands -------------------------------------------------------
+@app_commands.command(name="claim", description="Claim the order in this ticket")
 @app_commands.guild_only()
 async def claim_cmd(interaction: discord.Interaction):
     await do_claim(interaction)
 
 
-@tree.command(name="unclaim", description="Unclaim the order in this ticket")
+@app_commands.command(name="unclaim", description="Unclaim the order in this ticket")
 @app_commands.guild_only()
 async def unclaim_cmd(interaction: discord.Interaction):
     await do_unclaim(interaction)
 
 
-@tree.command(name="complete", description="Mark the order in this ticket as done")
+@app_commands.command(name="complete", description="Mark the order in this ticket as done")
 @app_commands.guild_only()
 async def complete_cmd(interaction: discord.Interaction):
     await do_complete(interaction)
 
 
-@tree.command(name="close", description="Close and delete this ticket (saves a transcript)")
+@app_commands.command(name="close", description="Close and delete this ticket (saves a transcript)")
 @app_commands.describe(reason="Why the ticket is being closed")
 @app_commands.guild_only()
 async def close_cmd(interaction: discord.Interaction, reason: Optional[str] = None):
@@ -1347,72 +1559,62 @@ async def close_cmd(interaction: discord.Interaction, reason: Optional[str] = No
         await send_error(interaction, str(exc))
 
 
-@tree.command(name="add", description="Add a member to this ticket")
+@app_commands.command(name="add", description="Add a member to this ticket")
 @app_commands.guild_only()
 async def add_cmd(interaction: discord.Interaction, member: discord.Member):
     try:
         get_ticket_or_fail(interaction.channel)
-        if not is_staff(interaction.user, store.guild(interaction.guild.id)):
-            raise TicketError("Only staff can add members to tickets.")
     except TicketError as exc:
         return await send_error(interaction, str(exc))
-    await interaction.channel.set_permissions(
-        member,
-        overwrite=discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True,
-                                              embed_links=True, read_message_history=True),
-        reason=f"Added by {interaction.user}",
-    )
-    embed = discord.Embed(description=f"➕ {member.mention} was added to the ticket by {interaction.user.mention}.",
-                          color=COLOR_GREEN)
-    await interaction.response.send_message(embed=stamp(embed))
+    await interaction.channel.set_permissions(member, overwrite=member_overwrite(), reason=f"Added by {interaction.user}")
+    await interaction.response.send_message(embed=note(
+        f"➕ {member.mention} was added to the ticket by {interaction.user.mention}.", COLOR_GREEN))
 
 
-@tree.command(name="remove", description="Remove a member from this ticket")
+@app_commands.command(name="remove", description="Remove a member from this ticket")
 @app_commands.guild_only()
 async def remove_cmd(interaction: discord.Interaction, member: discord.Member):
     try:
         ticket = get_ticket_or_fail(interaction.channel)
-        if not is_staff(interaction.user, store.guild(interaction.guild.id)):
-            raise TicketError("Only staff can remove members from tickets.")
         if member.id == ticket["owner_id"]:
-            raise TicketError("You can't remove the ticket owner — close the ticket instead.")
+            raise TicketError("You can't remove the customer — close the ticket instead.")
     except TicketError as exc:
         return await send_error(interaction, str(exc))
     await interaction.channel.set_permissions(member, overwrite=None, reason=f"Removed by {interaction.user}")
-    embed = discord.Embed(description=f"➖ {member.mention} was removed from the ticket by {interaction.user.mention}.",
-                          color=COLOR_RED)
-    await interaction.response.send_message(embed=stamp(embed))
+    await interaction.response.send_message(embed=note(
+        f"➖ {member.mention} was removed from the ticket by {interaction.user.mention}.", COLOR_RED))
 
 
-@tree.command(name="rename", description="Rename this ticket channel")
+@app_commands.command(name="rename", description="Rename this ticket channel")
 @app_commands.guild_only()
 async def rename_cmd(interaction: discord.Interaction, name: str):
     try:
         get_ticket_or_fail(interaction.channel)
-        if not is_staff(interaction.user, store.guild(interaction.guild.id)):
-            raise TicketError("Only staff can rename tickets.")
     except TicketError as exc:
         return await send_error(interaction, str(exc))
-    new = slugify(name) if name.strip() else None
-    if not new:
-        return await send_error(interaction, "Give a valid name.")
+    new = slugify(name)
     await interaction.response.defer(ephemeral=True, thinking=True)
     await interaction.channel.edit(name=new[:90], reason=f"Renamed by {interaction.user}")
     await interaction.followup.send(f"✏️ Renamed to `{new}`.", ephemeral=True)
 
 
-@tree.command(name="help", description="Show all Munchies bot commands")
+@app_commands.command(name="help", description="Show all Munchies bot commands")
+@app_commands.guild_only()
 async def help_cmd(interaction: discord.Interaction):
-    embed = discord.Embed(title=f"🍽️ {BRAND} Bot — Commands", color=COLOR_BLURPLE)
-    embed.add_field(name="⚙️ Setup (Admin)", value=(
-        "`/ticket` — set staff role + category and post the panel\n"
-        "`/setchef` — set the chef role that gets pinged\n"
+    g = store.guild(interaction.guild.id)
+    embed = discord.Embed(title=f"🍽️ {BRAND} Bot — Commands",
+                          description=f"🔒 Commands work for the **server owner** and {role_mention(g['chef_role'])} only.",
+                          color=COLOR_BLURPLE)
+    embed.add_field(name="⚙️ Setup (owner only)", value=(
+        "`/ticket` — set staff role, category, chef role and post the panel\n"
+        "`/setchef` — set the chef role\n"
         "`/setlogs` — set the transcript / log channel\n"
         "`/panel` — re-post the panel here"), inline=False)
-    embed.add_field(name="🕒 Staff", value=(
+    embed.add_field(name="🕒 Shifts", value=(
         "`/clockin` — show under Staff Online\n"
-        "`/clockout` — leave Staff Online\n"
-        "`/staffonline` — see who's working"), inline=False)
+        "`/clockout` — leave Staff Online (shows shift time)\n"
+        "`/staffonline` — who's working\n"
+        "`/stats` · `/leaderboard` — chef stats"), inline=False)
     embed.add_field(name="🎫 Tickets", value=(
         "`/claim` — claim the order (locks chat to customer + you + admins)\n"
         "`/unclaim` — give the order back\n"
@@ -1422,15 +1624,169 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
-# --------------------------------------------------------------------------
-if __name__ == "__main__":
-    if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise SystemExit("Set DISCORD_TOKEN or paste your bot token into TOKEN at the top of main.py")
+ALL_COMMANDS = [ticket_cmd, setchef_cmd, setlogs_cmd, panel_cmd, clockin_cmd, clockout_cmd, staffonline_cmd,
+                stats_cmd, leaderboard_cmd, claim_cmd, unclaim_cmd, complete_cmd, close_cmd, add_cmd,
+                remove_cmd, rename_cmd, help_cmd]
+
+
+# ==========================================================================
+# Client
+# ==========================================================================
+class MunchiesBot(discord.Client):
+    def __init__(self, message_content: bool):
+        intents = discord.Intents.default()
+        intents.message_content = message_content
+        super().__init__(intents=intents)
+        self.tree = GatedTree(self)
+        for cmd in ALL_COMMANDS:
+            self.tree.add_command(cmd)
+
+    async def setup_hook(self) -> None:
+        for view_cls in PERSISTENT_VIEWS:
+            self.add_view(view_cls())
+
+    async def sync_guild(self, guild: discord.Guild) -> None:
+        self.tree.copy_global_to(guild=guild)
+        try:
+            cmds = await self.tree.sync(guild=guild)
+            log.info("Synced %d commands to %s", len(cmds), guild.name)
+        except discord.HTTPException as exc:
+            log.error("Command sync failed for %s: %s", guild.name, exc)
+
+    async def on_ready(self):
+        invite = discord.utils.oauth_url(self.user.id, permissions=discord.Permissions(administrator=True),
+                                         scopes=("bot", "applications.commands"))
+        log.info("Logged in as %s (%s) - in %d server(s)", self.user, self.user.id, len(self.guilds))
+        log.info("Typed answers: %s", "ON" if TYPED_INPUT else "OFF (forms only - enable Message Content Intent to allow typing)")
+        log.info("Invite link: %s", invite)
+        if not self.guilds:
+            log.warning("The bot is NOT in any server yet. Open the invite link above to add it.")
+        for guild in self.guilds:
+            await self.sync_guild(guild)
+        stale = [cid for cid, t in store.tickets().items()
+                 if (gd := self.get_guild(t["guild_id"])) is not None and gd.get_channel(int(cid)) is None]
+        for cid in stale:
+            store.delete_ticket(int(cid))
+        for t in store.tickets().values():
+            t.pop("closing", None)
+        store.save()
+        for guild in self.guilds:
+            await refresh_panels(guild)
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="🍽️ orders"))
+        log.info("%s Order Desk is online and ready.", BRAND)
+
+    async def on_guild_join(self, guild: discord.Guild):
+        log.info("Joined %s - syncing commands", guild.name)
+        await self.sync_guild(guild)
+
+    async def on_guild_channel_delete(self, channel):
+        store.delete_ticket(channel.id)
+        channel_locks.pop(channel.id, None)
+
+    async def on_message(self, message: discord.Message):
+        if not TYPED_INPUT or message.author.bot or message.guild is None:
+            return
+        ticket = store.ticket(message.channel.id)
+        if ticket is None or message.author.id != ticket["owner_id"]:
+            return
+        if ticket["stage"] not in ("address", "screenshot", "payment"):
+            return
+        async with lock_for(message.channel.id):
+            ticket = store.ticket(message.channel.id)
+            if ticket is None or ticket["stage"] not in ("address", "screenshot", "payment"):
+                return
+            try:
+                await handle_typed_message(message, ticket)
+            except discord.HTTPException as exc:
+                log.warning("Order message error in %s: %s", message.channel.id, exc)
+
+
+# ==========================================================================
+# Startup
+# ==========================================================================
+def preflight(token: str) -> Optional[dict]:
+    """Ask Discord about the app before connecting. Returns None if the check couldn't run."""
+    req = urllib.request.Request(
+        "https://discord.com/api/v10/oauth2/applications/@me",
+        headers={"Authorization": f"Bot {token}", "User-Agent": "DiscordBot (https://github.com/Rapptz/discord.py, 2)"},
+    )
     try:
-        bot.run(TOKEN)
-    except discord.PrivilegedIntentsRequired:
-        raise SystemExit(
-            "Enable 'MESSAGE CONTENT INTENT' at https://discord.com/developers/applications -> your app -> Bot, then run again."
-        )
-    except discord.LoginFailure:
-        raise SystemExit("Discord rejected the token. Reset it in the Developer Portal (Bot -> Reset Token) and paste the new one.")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return {"invalid": True}
+        log.warning("Pre-check failed (HTTP %s) - continuing", exc.code)
+        return None
+    except Exception as exc:  # network / SSL problems: just skip the pre-check
+        log.warning("Pre-check skipped (%s) - continuing", exc)
+        return None
+    return {
+        "invalid": False,
+        "name": data.get("name"),
+        "message_content": bool(int(data.get("flags", 0)) & INTENT_MESSAGE_CONTENT),
+        "guilds": data.get("bot_approximate_guild_count"),
+    }
+
+
+def pause_before_exit() -> None:
+    if os.name == "nt":
+        try:
+            input("\nPress Enter to close this window...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+def main() -> None:
+    global TYPED_INPUT
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    discord.utils.setup_logging(level=logging.INFO)
+    discord.VoiceClient.warn_nacl = False     # no voice features used - hide noisy warnings
+    discord.VoiceClient.warn_dave = False
+
+    if discord.version_info < (2, 7, 0):
+        log.error("discord.py %s is too old. Run:  pip install -U \"discord.py>=2.7\"", discord.__version__)
+        return pause_before_exit()
+
+    if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+        log.error("No token. Paste your bot token into TOKEN at the top of main.py.")
+        return pause_before_exit()
+
+    info = preflight(TOKEN)
+    if info and info["invalid"]:
+        log.error("Discord rejected the token. Developer Portal -> Bot -> Reset Token, then paste the new one.")
+        return pause_before_exit()
+
+    attempts = [True, False]
+    if info is not None:
+        log.info("App '%s' found. Message Content Intent: %s. Servers: %s", info["name"],
+                 "ENABLED" if info["message_content"] else "disabled", info["guilds"])
+        if not info["message_content"]:
+            log.warning("Message Content Intent is OFF -> customers answer with pop-up forms. "
+                        "To also allow typed answers: Developer Portal -> Bot -> MESSAGE CONTENT INTENT -> Save.")
+            attempts = [False]
+
+    for use_mc in attempts:
+        TYPED_INPUT = use_mc
+        bot = MunchiesBot(message_content=use_mc)
+        try:
+            bot.run(TOKEN, log_handler=None)
+            return
+        except discord.PrivilegedIntentsRequired:
+            log.warning("Message Content Intent isn't enabled - restarting in forms-only mode.")
+            continue
+        except discord.LoginFailure:
+            log.error("Discord rejected the token. Developer Portal -> Bot -> Reset Token, then paste the new one.")
+            break
+        except Exception:
+            log.error("Bot crashed:\n%s", traceback.format_exc())
+            break
+    pause_before_exit()
+
+
+if __name__ == "__main__":
+    main()
