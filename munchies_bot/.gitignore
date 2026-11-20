@@ -1,0 +1,5 @@
+__pycache__/
+munchies_data.json
+*.tmp
+*.corrupt.json
+.env
