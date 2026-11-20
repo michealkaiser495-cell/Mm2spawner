@@ -1,5 +1,5 @@
 __pycache__/
-munchies_data.json
+foodandb4u_data.json
 *.tmp
 *.corrupt.json
 .env

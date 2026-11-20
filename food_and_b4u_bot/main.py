@@ -1,5 +1,5 @@
 """
-Munchies Order Desk v2 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v3 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -40,13 +40,13 @@ from discord import app_commands
 # ==========================================================================
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip() or "PASTE_YOUR_BOT_TOKEN_HERE"
 
-BRAND = "Munchies"
+BRAND = "Food and b4u"
 CURRENCY = "$"
 PRICE_DIVISOR = Decimal(3)              # customer pays 1/3 of the order total
 MAX_ORDER_TOTAL = Decimal("100000")
 CLOSE_DELAY_SECONDS = 5
 TICKET_COOLDOWN_SECONDS = 10
-DATA_FILE = Path(__file__).with_name("munchies_data.json")
+DATA_FILE = Path(__file__).with_name("foodandb4u_data.json")
 
 PAYMENT_METHODS = [
     ("Cash App", "💵"), ("PayPal", "🅿️"), ("Venmo", "💙"), ("Zelle", "⚡"),
@@ -70,7 +70,7 @@ KIND_INFO = {
 INTENT_MESSAGE_CONTENT = (1 << 18) | (1 << 19)   # GATEWAY_MESSAGE_CONTENT | _LIMITED
 TYPED_INPUT = True                                # set at startup from the app's intent setting
 
-log = logging.getLogger("munchies")
+log = logging.getLogger("foodb4u")
 
 
 # ==========================================================================
@@ -84,6 +84,9 @@ class Store:
         "clocked_in": {},        # {user_id: unix_since}
         "stats": {},             # {user_id: {"orders": int, "revenue": str, "seconds": int}}
         "orders_completed": 0,
+        "completion_seconds": 0, # total claim->complete time, for the average
+        "customers": {},         # {user_id: {"orders": int, "spent": str}}
+        "blacklist": {},         # {user_id: reason}
         "counter": 0,
     }
 
@@ -127,7 +130,15 @@ class Store:
         s.setdefault("orders", 0)
         s.setdefault("revenue", "0")
         s.setdefault("seconds", 0)
+        s.setdefault("rating_sum", 0)
+        s.setdefault("rating_count", 0)
         return s
+
+    def customer(self, guild_id: int, user_id: int) -> dict:
+        c = self.guild(guild_id)["customers"].setdefault(str(user_id), {})
+        c.setdefault("orders", 0)
+        c.setdefault("spent", "0")
+        return c
 
     def ticket(self, channel_id: int) -> Optional[dict]:
         return self.data["tickets"].get(str(channel_id))
@@ -329,15 +340,22 @@ def panel_embed(guild: Optional[discord.Guild], g: dict) -> discord.Embed:
         color=COLOR_GREEN,
     )
     embed.add_field(name="Status", value="🟢 Open — taking orders", inline=False)
-    embed.add_field(name="Staff Online", value=staff_text[:1024], inline=False)
-    embed.add_field(name="📦 Orders Completed", value=f"**{g['orders_completed']:,}**", inline=True)
-    embed.add_field(name="💰 You Pay", value=f"Only **1/{PRICE_DIVISOR}** of your total", inline=True)
+    embed.add_field(name=f"Staff Online ({len(online)})", value=staff_text[:1024], inline=False)
+    done = g["orders_completed"]
+    avg = duration(g["completion_seconds"] / done) if done else "—"
+    rsum = sum(v.get("rating_sum", 0) for v in g["stats"].values())
+    rcount = sum(v.get("rating_count", 0) for v in g["stats"].values())
+    embed.add_field(name="📦 Orders Completed", value=f"**{done:,}**", inline=True)
+    embed.add_field(name="⚡ Avg. Completion", value=avg, inline=True)
+    embed.add_field(name="⭐ Customer Rating", value=rating_text(rsum, rcount), inline=True)
+    embed.add_field(name="💰 You Pay", value=f"Only **1/{PRICE_DIVISOR}** of your order total — tax & delivery included",
+                    inline=False)
     if guild and guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
     return stamp(embed)
 
 
-def welcome_embed(ticket: dict, g: dict) -> discord.Embed:
+def welcome_embed(ticket: dict, g: dict, member: Optional[discord.Member] = None) -> discord.Embed:
     info = KIND_INFO[ticket["kind"]]
     embed = discord.Embed(title=f"{info['title']} #{ticket['number']:04d}", color=info["color"])
     if ticket["kind"] == "support":
@@ -370,7 +388,15 @@ def welcome_embed(ticket: dict, g: dict) -> discord.Embed:
         value=(" ".join(mention(u) for u in online) if online else "*No staff clocked in — someone will be with you soon*")[:1024],
         inline=False,
     )
+    if member is not None:
+        joined = ts(member.joined_at.timestamp()) if member.joined_at else "—"
+        embed.add_field(name="👤 Customer Info", value=(
+            f"**Account created:** {ts(member.created_at.timestamp())}\n"
+            f"**Joined server:** {joined}\n"
+            f"**History:** {customer_history(g, member.id)}"), inline=False)
+        embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="🕒 Opened", value=ts(ticket["opened_at"], "f"), inline=True)
+    embed.add_field(name="🎫 Ticket ID", value=f"`#{ticket['number']:04d}`", inline=True)
     embed.add_field(name="🔒 Done?", value="Press **Close Ticket** below.", inline=True)
     return stamp(embed, f"Ticket #{ticket['number']:04d}")
 
@@ -440,7 +466,7 @@ def step_payment_embed(total: Decimal, due: Decimal) -> discord.Embed:
     return stamp(embed, "Step 4/4")
 
 
-def summary_embed(t: dict, status: str, image_name: Optional[str]) -> discord.Embed:
+def summary_embed(t: dict, image_name: Optional[str]) -> discord.Embed:
     vip = t["kind"] == "vip"
     embed = discord.Embed(
         title=("⭐ VIP " if vip else "") + "🧑‍🍳 New Order — Ready for a Chef",
@@ -454,24 +480,58 @@ def summary_embed(t: dict, status: str, image_name: Optional[str]) -> discord.Em
     embed.add_field(name="🧾 Order Total", value=money(Decimal(t["total"])), inline=True)
     embed.add_field(name="💵 Customer Pays", value=f"**{money(Decimal(t['due']))}**", inline=True)
     embed.add_field(name="💳 Payment", value=payment_text(t), inline=True)
+    embed.add_field(name="💰 Payment Status", value=paid_text(t), inline=True)
+    embed.add_field(name="👥 Customer History", value=customer_history(store.guild(t["guild_id"]), t["owner_id"]),
+                    inline=True)
     embed.add_field(name="🕒 Opened", value=ts(t["opened_at"]), inline=True)
-    embed.add_field(name="📨 Submitted", value=ts(t.get("submitted_at") or time.time()), inline=True)
-    embed.add_field(name="📌 Status", value=status, inline=False)
+    embed.add_field(name="📌 Status", value=order_status(t), inline=False)
+    embed.add_field(name="🧭 Timeline", value=timeline_text(t), inline=False)
     if image_name:
         embed.set_image(url=f"attachment://{image_name}")
     return stamp(embed, f"Order #{t['number']:04d}")
 
 
-def status_waiting() -> str:
+def order_status(t: dict) -> str:
+    chef = mention(t.get("claimed_by"))
+    if t.get("completed"):
+        return f"✅ Completed by {chef}"
+    if t.get("onway_at"):
+        return f"🚗 Out for delivery — handled by {chef}"
+    if t.get("placed_at"):
+        return f"🛒 Order placed by {chef}"
+    if t.get("claimed_by"):
+        return f"🔵 Claimed by {chef} — cooking now 🍳"
     return "🟠 Waiting for a chef to **claim** this order"
 
 
-def status_claimed(user_id: int) -> str:
-    return f"🔵 Claimed by {mention(user_id)} — cooking now 🍳"
+TIMELINE = [
+    ("submitted_at", "📨 Submitted"), ("claimed_at", "🙋 Claimed"), ("paid_at", "💰 Payment received"),
+    ("placed_at", "🛒 Order placed"), ("onway_at", "🚗 Out for delivery"), ("completed_at", "✅ Completed"),
+]
 
 
-def status_done(user_id: int) -> str:
-    return f"✅ Completed by {mention(user_id)}"
+def timeline_text(t: dict) -> str:
+    return "\n".join(f"{'🟢' if t.get(k) else '⚪'} {label}" + (f" — {ts(t[k])}" if t.get(k) else "")
+                     for k, label in TIMELINE)
+
+
+def paid_text(t: dict) -> str:
+    return f"✅ Received {ts(t['paid_at'])}" if t.get("paid_at") else "⏳ Not received yet"
+
+
+def stars(n: int) -> str:
+    return "⭐" * n + "☆" * (5 - n)
+
+
+def rating_text(rsum: int, rcount: int) -> str:
+    return f"⭐ {rsum / rcount:.1f}/5 ({rcount})" if rcount else "*no ratings yet*"
+
+
+def customer_history(g: dict, user_id: int) -> str:
+    c = g["customers"].get(str(user_id))
+    if not c or not c.get("orders"):
+        return "🆕 First order"
+    return f"🔁 Returning — **{c['orders']}** order(s) • {money(Decimal(c['spent']))} paid"
 
 
 def note(text: str, color: int = COLOR_ORANGE, extra: Optional[str] = None) -> discord.Embed:
@@ -560,17 +620,17 @@ class PanelView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Create Order", emoji="🧾", style=discord.ButtonStyle.primary,
-                       custom_id="munchies:panel:order")
+                       custom_id="fb4u:panel:order")
     async def create_order(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_ticket(interaction, "order")
 
     @discord.ui.button(label="Support", emoji="💬", style=discord.ButtonStyle.secondary,
-                       custom_id="munchies:panel:support")
+                       custom_id="fb4u:panel:support")
     async def support(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_ticket(interaction, "support")
 
     @discord.ui.button(label="VIP", emoji="⭐", style=discord.ButtonStyle.danger,
-                       custom_id="munchies:panel:vip")
+                       custom_id="fb4u:panel:vip")
     async def vip(self, interaction: discord.Interaction, button: discord.ui.Button):
         await open_ticket(interaction, "vip")
 
@@ -580,7 +640,7 @@ class TicketControlView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Close Ticket", emoji="🔒", style=discord.ButtonStyle.danger,
-                       custom_id="munchies:ticket:close")
+                       custom_id="fb4u:ticket:close")
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             ticket = get_ticket_or_fail(interaction.channel)
@@ -639,7 +699,7 @@ class AddressStepView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Enter Restaurant & Address", emoji="📝", style=discord.ButtonStyle.primary,
-                       custom_id="munchies:step:address")
+                       custom_id="fb4u:step:address")
     async def enter(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await step_guard(interaction, "address"):
             await interaction.response.send_modal(AddressModal())
@@ -650,7 +710,7 @@ class ShotStepView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Upload Screenshot & Total", emoji="📸", style=discord.ButtonStyle.primary,
-                       custom_id="munchies:step:shot")
+                       custom_id="fb4u:step:shot")
     async def upload(self, interaction: discord.Interaction, button: discord.ui.Button):
         if await step_guard(interaction, "screenshot"):
             await interaction.response.send_modal(ScreenshotModal())
@@ -661,7 +721,7 @@ class PayStepView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Choose Payment", emoji="💳", style=discord.ButtonStyle.success,
-                       custom_id="munchies:step:pay")
+                       custom_id="fb4u:step:pay")
     async def pay(self, interaction: discord.Interaction, button: discord.ui.Button):
         ticket = await step_guard(interaction, "payment")
         if ticket:
@@ -676,12 +736,12 @@ class AddressConfirmView(discord.ui.View):
             self.no.disabled = True
 
     @discord.ui.button(label="Yes, that's correct", emoji="✅", style=discord.ButtonStyle.success,
-                       custom_id="munchies:order:addr_yes")
+                       custom_id="fb4u:order:addr_yes")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         await answer_address(interaction, correct=True)
 
     @discord.ui.button(label="No, retype it", emoji="❌", style=discord.ButtonStyle.danger,
-                       custom_id="munchies:order:addr_no")
+                       custom_id="fb4u:order:addr_no")
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         await answer_address(interaction, correct=False)
 
@@ -700,31 +760,88 @@ class ClaimView(discord.ui.View):
             self.claim.style = discord.ButtonStyle.secondary
 
     @discord.ui.button(label="Claim Order", emoji="🙋", style=discord.ButtonStyle.success,
-                       custom_id="munchies:order:claim")
+                       custom_id="fb4u:order:claim")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         await do_claim(interaction)
 
 
 class ClaimedView(discord.ui.View):
-    def __init__(self, disabled: bool = False):
+    """Chef controls: progress the order step by step, unclaim, or complete."""
+
+    def __init__(self, ticket: Optional[dict] = None, disabled: bool = False):
         super().__init__(timeout=None)
+        t = ticket or {}
         if disabled:
-            self.unclaim.disabled = True
-            self.complete.disabled = True
+            for item in self.children:
+                item.disabled = True
+            return
+        for key, button, done_label in (("paid_at", self.paid, "Paid"), ("placed_at", self.placed, "Placed"),
+                                        ("onway_at", self.onway, "On The Way")):
+            if t.get(key):
+                button.disabled = True
+                button.label = done_label
+                button.style = discord.ButtonStyle.secondary
+
+    @discord.ui.button(label="Payment Received", emoji="💰", style=discord.ButtonStyle.primary,
+                       custom_id="fb4u:order:paid", row=0)
+    async def paid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_progress(interaction, "paid")
+
+    @discord.ui.button(label="Order Placed", emoji="🛒", style=discord.ButtonStyle.primary,
+                       custom_id="fb4u:order:placed", row=0)
+    async def placed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_progress(interaction, "placed")
+
+    @discord.ui.button(label="On The Way", emoji="🚗", style=discord.ButtonStyle.primary,
+                       custom_id="fb4u:order:onway", row=0)
+    async def onway(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_progress(interaction, "onway")
 
     @discord.ui.button(label="Unclaim", emoji="↩️", style=discord.ButtonStyle.secondary,
-                       custom_id="munchies:order:unclaim")
+                       custom_id="fb4u:order:unclaim", row=1)
     async def unclaim(self, interaction: discord.Interaction, button: discord.ui.Button):
         await do_unclaim(interaction)
 
     @discord.ui.button(label="Mark Complete", emoji="✅", style=discord.ButtonStyle.success,
-                       custom_id="munchies:order:complete")
+                       custom_id="fb4u:order:complete", row=1)
     async def complete(self, interaction: discord.Interaction, button: discord.ui.Button):
         await do_complete(interaction)
 
 
+class RateView(discord.ui.View):
+    """Customer rates the finished order 1-5 stars."""
+
+    def __init__(self, chosen: int = 0):
+        super().__init__(timeout=None)
+        if chosen:
+            for item in self.children:
+                item.disabled = True
+                if item.custom_id == f"fb4u:rate:{chosen}":
+                    item.style = discord.ButtonStyle.success
+
+    @discord.ui.button(label="1", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="fb4u:rate:1")
+    async def r1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_rate(interaction, 1)
+
+    @discord.ui.button(label="2", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="fb4u:rate:2")
+    async def r2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_rate(interaction, 2)
+
+    @discord.ui.button(label="3", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="fb4u:rate:3")
+    async def r3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_rate(interaction, 3)
+
+    @discord.ui.button(label="4", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="fb4u:rate:4")
+    async def r4(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_rate(interaction, 4)
+
+    @discord.ui.button(label="5", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="fb4u:rate:5")
+    async def r5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_rate(interaction, 5)
+
+
 PERSISTENT_VIEWS = (PanelView, TicketControlView, AddressStepView, ShotStepView, PayStepView,
-                    AddressConfirmView, ClaimView, ClaimedView)
+                    AddressConfirmView, ClaimView, ClaimedView, RateView)
 
 
 # ==========================================================================
@@ -772,6 +889,10 @@ async def open_ticket(interaction: discord.Interaction, kind: str) -> None:
     category = guild.get_channel(g["category"]) if g["category"] else None
     if not isinstance(category, discord.CategoryChannel) or not g["staff_role"]:
         return await send_error(interaction, "The ticket system isn't set up yet. The server owner needs to run `/ticket`.")
+
+    if str(member.id) in g["blacklist"]:
+        return await send_error(interaction, "🚫 You're blocked from opening tickets here.\n"
+                                             f"**Reason:** {g['blacklist'][str(member.id)]}")
 
     if kind == "vip" and g["vip_role"] and not has_role(member, g["vip_role"]) and not is_owner(member):
         return await send_error(interaction, f"⭐ VIP tickets are only for {role_mention(g['vip_role'])}.\n"
@@ -828,7 +949,7 @@ async def open_ticket(interaction: discord.Interaction, kind: str) -> None:
     }
     store.set_ticket(channel.id, ticket)
 
-    await channel.send(content=member.mention, embed=welcome_embed(ticket, g), view=TicketControlView(),
+    await channel.send(content=member.mention, embed=welcome_embed(ticket, g, member), view=TicketControlView(),
                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
     if kind != "support":
         await send_step(channel, ticket, step_address_embed(), AddressStepView())
@@ -1006,12 +1127,12 @@ async def send_order_summary(channel: discord.TextChannel, ticket: dict) -> None
     msg = None
     if file:
         try:
-            msg = await channel.send(content=content, embed=summary_embed(ticket, status_waiting(), file.filename),
+            msg = await channel.send(content=content, embed=summary_embed(ticket, file.filename),
                                      file=file, view=ClaimView(), allowed_mentions=allowed)
         except discord.HTTPException as exc:
             log.warning("Summary re-upload failed (%s); sending link instead", exc)
     if msg is None:
-        embed = summary_embed(ticket, status_waiting(), None)
+        embed = summary_embed(ticket, None)
         embed.add_field(name="📸 Screenshot",
                         value=f"[Jump to screenshot]({jump})" if jump else "*Screenshot unavailable*", inline=False)
         msg = await channel.send(content=content, embed=embed, view=ClaimView(), allowed_mentions=allowed)
@@ -1051,18 +1172,21 @@ async def answer_address(interaction: discord.Interaction, correct: bool) -> Non
 # ==========================================================================
 # Claim / Unclaim / Complete / Close
 # ==========================================================================
-async def update_summary(channel, ticket: dict, status: str, view: discord.ui.View) -> None:
+async def update_summary(channel, ticket: dict, view: discord.ui.View) -> None:
     if not ticket.get("summary_msg_id"):
         return
+    live = {"📌 Status": order_status(ticket), "🧭 Timeline": timeline_text(ticket),
+            "💰 Payment Status": paid_text(ticket)}
     try:
         msg = await channel.fetch_message(ticket["summary_msg_id"])
         if not msg.embeds:
             return
         embed = msg.embeds[0]
         for i, field in enumerate(embed.fields):
-            if field.name == "📌 Status":
-                embed.set_field_at(i, name="📌 Status", value=status, inline=False)
-                break
+            if field.name in live:
+                embed.set_field_at(i, name=field.name, value=live[field.name], inline=field.inline)
+        if ticket.get("completed"):
+            embed.color = COLOR_GREEN
         await msg.edit(embed=embed, view=view)
     except discord.HTTPException as exc:
         log.warning("Summary update failed in %s: %s", channel.id, exc)
@@ -1103,7 +1227,7 @@ async def do_claim(interaction: discord.Interaction) -> None:
             await channel.set_permissions(member, overwrite=member_overwrite(), reason=f"Claimed by {member}")
 
         ticket.update(claimed_by=member.id, claimed_at=int(time.time()))
-        await update_summary(channel, ticket, status_claimed(member.id), ClaimView(claimed=True))
+        await update_summary(channel, ticket, ClaimView(claimed=True))
 
         embed = discord.Embed(
             title="🙋 Order Claimed",
@@ -1117,11 +1241,17 @@ async def do_claim(interaction: discord.Interaction) -> None:
             embed.add_field(name="💵 Amount Due", value=money(Decimal(ticket["due"])), inline=True)
             embed.add_field(name="💳 Payment", value=payment_text(ticket), inline=True)
         embed.add_field(name="🕒 Claimed", value=ts(ticket["claimed_at"]), inline=True)
-        embed.add_field(name="🛠️ Chef Controls",
-                        value="**↩️ Unclaim** — give the order back\n**✅ Mark Complete** — finish the order (or `/complete`)",
+        embed.add_field(name="🛠️ Chef Controls", value=(
+            "**💰 Payment Received** — confirm the customer paid\n"
+            "**🛒 Order Placed** — you placed the order with the restaurant\n"
+            "**🚗 On The Way** — the food is out for delivery\n"
+            "**↩️ Unclaim** — give the order back\n"
+            "**✅ Mark Complete** — finish the order (or `/complete`)"), inline=False)
+        embed.add_field(name="📣 Customer updates",
+                        value="Every button pings the customer with a live update and fills in the order timeline.",
                         inline=False)
         msg = await channel.send(content=mention(ticket["owner_id"]), embed=stamp(embed, f"Order #{ticket['number']:04d}"),
-                                 view=ClaimedView(),
+                                 view=ClaimedView(ticket),
                                  allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
         ticket["claim_msg_id"] = msg.id
         store.set_ticket(channel.id, ticket)
@@ -1156,9 +1286,9 @@ async def do_unclaim(interaction: discord.Interaction) -> None:
             except discord.HTTPException:
                 pass
 
-        ticket.update(claimed_by=None, claimed_at=None)
+        ticket.update(claimed_by=None, claimed_at=None, placed_at=None, onway_at=None)
         await disable_claim_message(channel, ticket)
-        await update_summary(channel, ticket, status_waiting(), ClaimView())
+        await update_summary(channel, ticket, ClaimView())
         store.set_ticket(channel.id, ticket)
 
         ping_role = g["chef_role"] or g["staff_role"]
@@ -1193,19 +1323,23 @@ async def do_complete(interaction: discord.Interaction) -> None:
         guild = channel.guild
         g = store.guild(guild.id)
         chef = ticket["claimed_by"]
-        ticket.update(completed=True, stage="completed")
+        ticket.update(completed=True, stage="completed", completed_at=int(time.time()))
         await disable_claim_message(channel, ticket)
-        await update_summary(channel, ticket, status_done(chef), ClaimView(done=True))
+        await update_summary(channel, ticket, ClaimView(done=True))
         store.set_ticket(channel.id, ticket)
 
         s = store.stats(guild.id, chef)
         s["orders"] += 1
         if ticket.get("due"):
             s["revenue"] = str(Decimal(s["revenue"]) + Decimal(ticket["due"]))
-        g["orders_completed"] += 1
-        store.save()
-
         took = int(time.time()) - (ticket.get("claimed_at") or int(time.time()))
+        g["orders_completed"] += 1
+        g["completion_seconds"] += took
+        c = store.customer(guild.id, ticket["owner_id"])
+        c["orders"] += 1
+        if ticket.get("due"):
+            c["spent"] = str(Decimal(c["spent"]) + Decimal(ticket["due"]))
+        store.save()
         embed = discord.Embed(
             title="✅ Order Complete",
             description=(f"This order from {mention(ticket['owner_id'])} has been done by {mention(chef)}. 🎉\n\n"
@@ -1221,9 +1355,18 @@ async def do_complete(interaction: discord.Interaction) -> None:
             embed.add_field(name="💳 Payment", value=payment_text(ticket), inline=True)
         embed.add_field(name="⏱️ Time to complete", value=duration(took), inline=True)
         embed.add_field(name="🏆 Chef's orders", value=str(s["orders"]), inline=True)
+        embed.add_field(name="👥 Your orders with us", value=str(c["orders"]), inline=True)
+        embed.add_field(name="🧭 Timeline", value=timeline_text(ticket), inline=False)
         stamp(embed, f"Order #{ticket['number']:04d}")
         await channel.send(content=mention(ticket["owner_id"]), embed=embed, view=TicketControlView(),
                            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        rate = discord.Embed(
+            title="⭐ How was your order?",
+            description=(f"{mention(ticket['owner_id'])}, rate your experience with {mention(chef)} "
+                         "by pressing **1–5** below. It helps us keep the food (and service) great! 🍔"),
+            color=COLOR_GOLD,
+        )
+        await channel.send(embed=stamp(rate, f"Order #{ticket['number']:04d}"), view=RateView())
 
         # receipt DM to the customer (ignored if their DMs are closed)
         try:
@@ -1247,6 +1390,104 @@ async def do_complete(interaction: discord.Interaction) -> None:
                 pass
         await refresh_panels(guild)
         await finish(interaction, "✅ Order marked complete.")
+
+
+PROGRESS_STEPS = {
+    "paid":   ("paid_at",   "💰 Payment Received", COLOR_GREEN),
+    "placed": ("placed_at", "🛒 Order Placed",     COLOR_BLURPLE),
+    "onway":  ("onway_at",  "🚗 Out for Delivery", COLOR_GOLD),
+}
+
+
+async def do_progress(interaction: discord.Interaction, step: str) -> None:
+    channel, member = interaction.channel, interaction.user
+    key, title, color = PROGRESS_STEPS[step]
+    async with lock_for(channel.id):
+        try:
+            ticket = get_ticket_or_fail(channel)
+            if ticket["completed"]:
+                raise TicketError("This order is already completed.")
+            if not ticket["claimed_by"]:
+                raise TicketError("Claim the order first.")
+            if member.id != ticket["claimed_by"] and not is_owner(member):
+                raise TicketError(f"Only {mention(ticket['claimed_by'])} or the owner can update this order.")
+            if ticket.get(key):
+                raise TicketError(f"**{title}** was already marked {ts(ticket[key])}.")
+            if step == "onway" and not ticket.get("placed_at"):
+                raise TicketError("Mark **🛒 Order Placed** before **🚗 On The Way**.")
+        except TicketError as exc:
+            return await send_error(interaction, str(exc))
+
+        ticket[key] = int(time.time())
+        store.set_ticket(channel.id, ticket)
+        if interaction.message and interaction.message.id == ticket.get("claim_msg_id"):
+            await interaction.response.edit_message(view=ClaimedView(ticket))
+        else:
+            await ack(interaction)
+            if ticket.get("claim_msg_id"):
+                try:
+                    await channel.get_partial_message(ticket["claim_msg_id"]).edit(view=ClaimedView(ticket))
+                except discord.HTTPException:
+                    pass
+
+        chef, customer = mention(ticket["claimed_by"]), mention(ticket["owner_id"])
+        where = ticket.get("restaurant") or "the restaurant"
+        if step == "paid":
+            due = money(Decimal(ticket["due"])) if ticket.get("due") else "your payment"
+            text = (f"{chef} confirmed your payment of **{due}** via **{payment_text(ticket)}**. ✅\n"
+                    "Your order is being placed next!")
+        elif step == "placed":
+            text = (f"{chef} placed your order at **{where}**. 🧾\n"
+                    "Keep your phone nearby in case the restaurant or driver contacts you.")
+        else:
+            text = (f"Your food is on the way! 🚗💨\n📍 Delivering to: **{ticket.get('address') or 'your address'}**\n"
+                    "Watch the door — it'll be there soon.")
+        embed = discord.Embed(title=title, description=text, color=color)
+        embed.add_field(name="🧭 Progress", value=timeline_text(ticket), inline=False)
+        await channel.send(content=customer, embed=stamp(embed, f"Order #{ticket['number']:04d}"),
+                           allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+        await update_summary(channel, ticket, ClaimView(claimed=True))
+        await finish(interaction, f"✅ {title} sent to the customer.")
+
+
+async def do_rate(interaction: discord.Interaction, score: int) -> None:
+    channel = interaction.channel
+    async with lock_for(channel.id):
+        ticket = store.ticket(channel.id) if channel else None
+        if ticket is None:
+            return await send_error(interaction, "This ticket no longer exists.")
+        if interaction.user.id != ticket["owner_id"]:
+            return await send_error(interaction, "Only the customer can rate this order.")
+        if not ticket.get("completed"):
+            return await send_error(interaction, "You can rate once the order is complete.")
+        if ticket.get("rating"):
+            return await send_error(interaction, f"You already rated this order {stars(ticket['rating'])}.")
+
+        ticket["rating"] = score
+        store.set_ticket(channel.id, ticket)
+        s = store.stats(channel.guild.id, ticket["claimed_by"])
+        s["rating_sum"] += score
+        s["rating_count"] += 1
+        store.save()
+
+        embed = discord.Embed(
+            title="⭐ Thanks for your rating!",
+            description=(f"You rated {mention(ticket['claimed_by'])} **{stars(score)}** ({score}/5).\n"
+                         f"We appreciate you ordering with **{BRAND}**! 💛"),
+            color=COLOR_GOLD,
+        )
+        embed.add_field(name="🧑‍🍳 Chef's rating", value=rating_text(s["rating_sum"], s["rating_count"]), inline=True)
+        await interaction.response.edit_message(embed=stamp(embed, f"Order #{ticket['number']:04d}"),
+                                                view=RateView(chosen=score))
+        logch = get_log_channel(channel.guild)
+        if logch:
+            le = discord.Embed(title="⭐ New Rating", color=COLOR_GOLD,
+                               description=(f"{mention(ticket['owner_id'])} rated {mention(ticket['claimed_by'])} "
+                                            f"**{stars(score)}** for order #{ticket['number']:04d}."))
+            try:
+                await logch.send(embed=stamp(le), allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                pass
 
 
 def check_can_close(member: discord.Member, ticket: dict) -> None:
@@ -1350,7 +1591,7 @@ def owner_only():
 
 
 # ---- Setup (owner only) --------------------------------------------------
-@app_commands.command(name="ticket", description="Set up the Munchies ticket system and post the Order Desk panel")
+@app_commands.command(name="ticket", description="Set up the Food and b4u ticket system and post the Order Desk panel")
 @app_commands.describe(
     staff_role="Role that gets added to every ticket",
     category="Category the tickets will be created in",
@@ -1506,6 +1747,11 @@ async def stats_cmd(interaction: discord.Interaction, member: Optional[discord.M
     embed.add_field(name="📦 Orders completed", value=str(s["orders"]), inline=True)
     embed.add_field(name="💵 Payments handled", value=money(Decimal(s["revenue"])), inline=True)
     embed.add_field(name="⏱️ Time clocked", value=duration(s["seconds"] + (time.time() - since if since else 0)), inline=True)
+    embed.add_field(name="⭐ Rating", value=rating_text(s["rating_sum"], s["rating_count"]), inline=True)
+    c = g["customers"].get(str(member.id))
+    if c and c.get("orders"):
+        embed.add_field(name="🛍️ As a customer", value=f"{c['orders']} order(s) • {money(Decimal(c['spent']))} paid",
+                        inline=True)
     embed.add_field(name="🟢 Status", value=f"Clocked in {ts(since)}" if since else "🔴 Clocked out", inline=False)
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
@@ -1516,11 +1762,15 @@ async def leaderboard_cmd(interaction: discord.Interaction):
     g = store.guild(interaction.guild.id)
     top = sorted(g["stats"].items(), key=lambda kv: kv[1].get("orders", 0), reverse=True)[:10]
     medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 7
-    lines = [f"{medals[i]} {mention(uid)} — **{s.get('orders', 0)}** orders • {money(Decimal(s.get('revenue', '0')))}"
+    lines = [f"{medals[i]} {mention(uid)} — **{s.get('orders', 0)}** orders • "
+             f"{money(Decimal(s.get('revenue', '0')))} • {rating_text(s.get('rating_sum', 0), s.get('rating_count', 0))}"
              for i, (uid, s) in enumerate(top) if s.get("orders", 0)]
     embed = discord.Embed(title="🏆 Chef Leaderboard", description="\n".join(lines) or "*No completed orders yet*",
                           color=COLOR_GOLD)
     embed.add_field(name="📦 Total orders", value=str(g["orders_completed"]), inline=True)
+    embed.add_field(name="⚡ Avg. completion",
+                    value=duration(g["completion_seconds"] / g["orders_completed"]) if g["orders_completed"] else "—",
+                    inline=True)
     await interaction.response.send_message(embed=stamp(embed))
 
 
@@ -1598,7 +1848,64 @@ async def rename_cmd(interaction: discord.Interaction, name: str):
     await interaction.followup.send(f"✏️ Renamed to `{new}`.", ephemeral=True)
 
 
-@app_commands.command(name="help", description="Show all Munchies bot commands")
+@app_commands.command(name="orderinfo", description="Show every detail of the order in this ticket")
+@app_commands.guild_only()
+async def orderinfo_cmd(interaction: discord.Interaction):
+    try:
+        t = get_ticket_or_fail(interaction.channel)
+    except TicketError as exc:
+        return await send_error(interaction, str(exc))
+    info = KIND_INFO[t["kind"]]
+    embed = discord.Embed(title=f"🔎 {info['title']} #{t['number']:04d}", color=info["color"])
+    embed.add_field(name="👤 Customer", value=mention(t["owner_id"]), inline=True)
+    embed.add_field(name="🧑‍🍳 Chef", value=mention(t.get("claimed_by")), inline=True)
+    embed.add_field(name="📂 Step", value=f"`{t['stage']}`", inline=True)
+    if t.get("address"):
+        embed.add_field(name="🏠 Delivery Details", value=location_lines(t), inline=False)
+    if t.get("total"):
+        embed.add_field(name="🧾 Order Total", value=money(Decimal(t["total"])), inline=True)
+    if t.get("due"):
+        embed.add_field(name="💵 Customer Pays", value=money(Decimal(t["due"])), inline=True)
+    if t.get("payment"):
+        embed.add_field(name="💳 Payment", value=payment_text(t), inline=True)
+    embed.add_field(name="💰 Payment Status", value=paid_text(t), inline=True)
+    embed.add_field(name="⭐ Rating", value=stars(t["rating"]) if t.get("rating") else "—", inline=True)
+    embed.add_field(name="👥 Customer History", value=customer_history(store.guild(t["guild_id"]), t["owner_id"]),
+                    inline=True)
+    embed.add_field(name="📌 Status", value=order_status(t) if t["kind"] != "support" else "💬 Support ticket",
+                    inline=False)
+    embed.add_field(name="🧭 Timeline", value=f"🟢 🎫 Opened — {ts(t['opened_at'])}\n" + timeline_text(t), inline=False)
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+
+@app_commands.command(name="blacklist", description="Block a member from opening tickets")
+@app_commands.describe(member="Who to block", reason="Why (shown to them)")
+@app_commands.guild_only()
+@owner_only()
+async def blacklist_cmd(interaction: discord.Interaction, member: discord.Member, reason: Optional[str] = None):
+    g = store.guild(interaction.guild.id)
+    g["blacklist"][str(member.id)] = (reason or "No reason given")[:200]
+    store.save()
+    embed = discord.Embed(title="🚫 Member Blacklisted",
+                          description=f"{member.mention} can no longer open tickets.", color=COLOR_RED)
+    embed.add_field(name="📝 Reason", value=g["blacklist"][str(member.id)], inline=False)
+    embed.add_field(name="📋 Total blacklisted", value=str(len(g["blacklist"])), inline=True)
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+
+@app_commands.command(name="unblacklist", description="Allow a blocked member to open tickets again")
+@app_commands.guild_only()
+@owner_only()
+async def unblacklist_cmd(interaction: discord.Interaction, member: discord.Member):
+    g = store.guild(interaction.guild.id)
+    if g["blacklist"].pop(str(member.id), None) is None:
+        return await send_error(interaction, f"{member.mention} isn't blacklisted.")
+    store.save()
+    await interaction.response.send_message(embed=note(f"✅ {member.mention} can open tickets again.", COLOR_GREEN),
+                                            ephemeral=True)
+
+
+@app_commands.command(name="help", description="Show all Food and b4u bot commands")
 @app_commands.guild_only()
 async def help_cmd(interaction: discord.Interaction):
     g = store.guild(interaction.guild.id)
@@ -1609,7 +1916,8 @@ async def help_cmd(interaction: discord.Interaction):
         "`/ticket` — set staff role, category, chef role and post the panel\n"
         "`/setchef` — set the chef role\n"
         "`/setlogs` — set the transcript / log channel\n"
-        "`/panel` — re-post the panel here"), inline=False)
+        "`/panel` — re-post the panel here\n"
+        "`/blacklist` · `/unblacklist` — block / unblock a member from tickets"), inline=False)
     embed.add_field(name="🕒 Shifts", value=(
         "`/clockin` — show under Staff Online\n"
         "`/clockout` — leave Staff Online (shows shift time)\n"
@@ -1620,19 +1928,25 @@ async def help_cmd(interaction: discord.Interaction):
         "`/unclaim` — give the order back\n"
         "`/complete` — mark the order done\n"
         "`/close` — close & delete the ticket (transcript saved)\n"
+        "`/orderinfo` — every detail of this order\n"
         "`/add` · `/remove` · `/rename` — manage the ticket"), inline=False)
+    embed.add_field(name="🔘 Chef buttons (after claiming)", value=(
+        "💰 **Payment Received** → 🛒 **Order Placed** → 🚗 **On The Way** → ✅ **Mark Complete**\n"
+        "Each one pings the customer and updates the order timeline. ↩️ **Unclaim** gives it back."), inline=False)
+    embed.add_field(name="⭐ After completion", value="The customer rates the chef 1–5 stars (shown in `/stats` and "
+                                                       "`/leaderboard`) and gets a receipt in DMs.", inline=False)
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
 ALL_COMMANDS = [ticket_cmd, setchef_cmd, setlogs_cmd, panel_cmd, clockin_cmd, clockout_cmd, staffonline_cmd,
                 stats_cmd, leaderboard_cmd, claim_cmd, unclaim_cmd, complete_cmd, close_cmd, add_cmd,
-                remove_cmd, rename_cmd, help_cmd]
+                remove_cmd, rename_cmd, orderinfo_cmd, blacklist_cmd, unblacklist_cmd, help_cmd]
 
 
 # ==========================================================================
 # Client
 # ==========================================================================
-class MunchiesBot(discord.Client):
+class FoodBot(discord.Client):
     def __init__(self, message_content: bool):
         intents = discord.Intents.default()
         intents.message_content = message_content
@@ -1772,7 +2086,7 @@ def main() -> None:
 
     for use_mc in attempts:
         TYPED_INPUT = use_mc
-        bot = MunchiesBot(message_content=use_mc)
+        bot = FoodBot(message_content=use_mc)
         try:
             bot.run(TOKEN, log_handler=None)
             return
