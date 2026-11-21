@@ -1,5 +1,5 @@
 """
-Food and b4u Order Desk v4 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v5 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -24,11 +24,13 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
 import time
 import traceback
 import urllib.error
 import urllib.request
+from logging.handlers import RotatingFileHandler
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional
@@ -48,6 +50,8 @@ MAX_ORDER_TOTAL = Decimal("100000")
 CLOSE_DELAY_SECONDS = 5
 TICKET_COOLDOWN_SECONDS = 10
 DATA_FILE = Path(__file__).with_name("foodandb4u_data.json")
+LOG_FILE = Path(__file__).with_name("foodb4u.log")
+SINGLE_INSTANCE_PORT = 47361             # stops two copies of the bot running at once
 
 PAYMENT_METHODS = [
     ("Cash App", "💵"), ("PayPal", "🅿️"), ("Venmo", "💙"), ("Zelle", "⚡"),
@@ -65,6 +69,15 @@ DEFAULT_RESTAURANTS = [
      "Port Of Subs", "Buffalo Wild Wings", "Cracker Barrel", "Dunkin Donuts (pickup)", "Moe’s", "bonchon",
      "chillis", "daves hot chicken (pickup)", "hardees", "Dairy Queen"],
 ]
+PAY_ALIASES = {                           # what chefs type in a ticket: .venmo  .ca  .pay ...
+    "Cash App": ["cashapp", "cash", "ca", "cashtag"],
+    "PayPal": ["paypal", "pp"],
+    "Venmo": ["venmo", "ven", "vm"],
+    "Zelle": ["zelle", "zel"],
+    "Apple Pay": ["applepay", "apple", "ap"],
+    "Crypto": ["crypto", "btc", "eth", "ltc", "sol", "usdt"],
+}
+ALIAS_TO_METHOD = {alias: method for method, aliases in PAY_ALIASES.items() for alias in aliases}
 LIST_COLUMN_NAMES = ["🍗 List 1", "🍕 List 2", "🥤 List 3"]
 
 COLOR_GREEN = 0x57F287
@@ -101,6 +114,7 @@ class Store:
         "completion_seconds": 0, # total claim->complete time, for the average
         "customers": {},         # {user_id: {"orders": int, "spent": str}}
         "blacklist": {},         # {user_id: reason}
+        "payinfo": {},           # {user_id: {method: address}}  saved with /set
         "restaurants": DEFAULT_RESTAURANTS,   # 3 columns shown by /list
         "counter": 0,
     }
@@ -126,9 +140,19 @@ class Store:
         self.data.setdefault("tickets", {})
 
     def save(self) -> None:
+        payload = json.dumps(self.data, indent=2)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, indent=2), "utf-8")
-        os.replace(tmp, self.path)
+        for attempt in range(5):
+            try:
+                tmp.write_text(payload, "utf-8")
+                os.replace(tmp, self.path)
+                return
+            except OSError:
+                time.sleep(0.1 * (attempt + 1))
+        try:
+            self.path.write_text(payload, "utf-8")
+        except OSError as exc:
+            log.error("Could not save %s (%s) - is it open in another program?", self.path.name, exc)
 
     def guild(self, guild_id: int) -> dict:
         g = self.data["guilds"].setdefault(str(guild_id), {})
@@ -353,10 +377,16 @@ async def ack(interaction: discord.Interaction) -> None:
     """Acknowledge before slow work: silent for buttons, ephemeral 'thinking' for slash commands."""
     if interaction.response.is_done():
         return
-    if interaction.type == discord.InteractionType.application_command:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    else:
-        await interaction.response.defer()
+    try:
+        if interaction.type == discord.InteractionType.application_command:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        else:
+            await interaction.response.defer()
+    except discord.NotFound:
+        log.warning("A button/command expired before the bot answered (slow internet?) - continuing anyway.")
+    except discord.HTTPException as exc:
+        if exc.code != 40060:   # 40060 = already acknowledged
+            raise
 
 
 async def finish(interaction: discord.Interaction, text: str) -> None:
@@ -752,6 +782,9 @@ class SafeView(discord.ui.View):
     """Base view: any unexpected error is logged and shown to the user."""
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        if isinstance(error, discord.NotFound) and error.code == 10062:
+            log.warning("Button %s expired before the bot answered (slow internet?)", getattr(item, "custom_id", item))
+            return
         log.error("Button %s failed", getattr(item, "custom_id", item), exc_info=error)
         await send_error(interaction, "Something went wrong with that button. Please try again — "
                                       "if it keeps happening, ping the owner.")
@@ -966,6 +999,11 @@ class ClaimedView(SafeView):
                        custom_id="fb4u:order:onway", row=0)
     async def onway(self, interaction: discord.Interaction, button: discord.ui.Button):
         await do_progress(interaction, "onway")
+
+    @discord.ui.button(label="Payment Info", emoji="💸", style=discord.ButtonStyle.success,
+                       custom_id="fb4u:order:payinfo", row=1)
+    async def payinfo(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_payinfo(interaction)
 
     @discord.ui.button(label="Unclaim", emoji="↩️", style=discord.ButtonStyle.secondary,
                        custom_id="fb4u:order:unclaim", row=1)
@@ -1421,6 +1459,7 @@ async def do_claim(interaction: discord.Interaction) -> None:
             embed.add_field(name="💳 Payment", value=payment_text(ticket), inline=True)
         embed.add_field(name="🕒 Claimed", value=ts(ticket["claimed_at"]), inline=True)
         embed.add_field(name="🛠️ Chef Controls", value=(
+            "**💸 Payment Info** — post YOUR saved payment address (from `/set`)\n"
             "**💰 Payment Received** — confirm the customer paid\n"
             "**🛒 Order Placed** — you placed the order with the restaurant\n"
             "**🚗 On The Way** — the food is out for delivery\n"
@@ -1669,6 +1708,71 @@ async def do_rate(interaction: discord.Interaction, score: int) -> None:
                 await logch.send(embed=stamp(le), allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:
                 pass
+
+
+def saved_pay(g: dict, user_id: int) -> dict:
+    return g["payinfo"].get(str(user_id), {})
+
+
+def pick_methods(saved: dict, ticket: Optional[dict], wanted: Optional[str]) -> list:
+    if wanted:
+        return [(wanted, saved[wanted])] if wanted in saved else []
+    if ticket and ticket.get("payment"):        # match what the customer picked
+        for method in saved:
+            if method.lower() in ticket["payment"].lower():
+                return [(method, saved[method])]
+    return list(saved.items())
+
+
+def pay_info_embed(chef: discord.Member, methods: list, ticket: Optional[dict]) -> discord.Embed:
+    due = money(Decimal(ticket["due"])) if ticket and ticket.get("due") else None
+    send = f"**{due}**" if due else "your payment"
+    if len(methods) == 1:
+        method, address = methods[0]
+        embed = discord.Embed(title=f"{dict(PAYMENT_METHODS).get(method, '💳')} {method} — Payment Info",
+                              description=f"Send {send} to {chef.mention} on **{method}**:\n```\n{address}\n```",
+                              color=COLOR_GREEN)
+    else:
+        embed = discord.Embed(title="💸 Payment Info",
+                              description=f"Send {send} to {chef.mention} with **any** of these:", color=COLOR_GREEN)
+        for method, address in methods:
+            embed.add_field(name=f"{dict(PAYMENT_METHODS).get(method, '💳')} {method}",
+                            value=f"```\n{address}\n```", inline=True)
+    if due:
+        embed.add_field(name="💵 Amount Due", value=f"**{due}**", inline=True)
+    if ticket:
+        embed.add_field(name="🆔 Order", value=f"#{ticket['number']:04d}", inline=True)
+    embed.add_field(name="🧑‍🍳 Chef", value=chef.mention, inline=True)
+    embed.add_field(name="📸 After you pay",
+                    value="Send a **screenshot of the payment** here so your chef can confirm it.", inline=False)
+    embed.set_thumbnail(url=chef.display_avatar.url)
+    return stamp(embed, f"Order #{ticket['number']:04d}" if ticket else None)
+
+
+async def post_pay_info(channel, chef: discord.Member, wanted: Optional[str] = None) -> Optional[str]:
+    """Post the chef's own saved payment info. Returns an error message, or None on success."""
+    g = store.guild(channel.guild.id)
+    saved = saved_pay(g, chef.id)
+    if not saved:
+        return "You haven't saved any payment info yet. Use `/set` first — e.g. `/set method:Venmo address:973 202 0355`."
+    ticket = store.ticket(channel.id)
+    methods = pick_methods(saved, ticket, wanted)
+    if not methods:
+        return f"You haven't saved **{wanted}** yet. Use `/set` to add it. You have: {', '.join(saved)}."
+    await channel.send(content=mention(ticket["owner_id"]) if ticket else None,
+                       embed=pay_info_embed(chef, methods, ticket),
+                       allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    return None
+
+
+async def do_payinfo(interaction: discord.Interaction) -> None:
+    g = store.guild(interaction.guild.id)
+    if not can_use_commands(interaction.user, g):
+        return await send_error(interaction, "Only chefs or the owner can send payment info.")
+    await ack(interaction)
+    error = await post_pay_info(interaction.channel, interaction.user)
+    if error:
+        await send_error(interaction, error)
 
 
 def check_can_close(member: discord.Member, ticket: dict) -> None:
@@ -2201,6 +2305,81 @@ async def queue_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
+PAY_CHOICES = [app_commands.Choice(name=f"{emoji} {name}", value=name) for name, emoji in PAYMENT_METHODS
+               if name in PAY_ALIASES]
+
+
+def saved_pay_embed(member: discord.Member, saved: dict, title: str) -> discord.Embed:
+    embed = discord.Embed(title=title, color=COLOR_GREEN)
+    for method, address in saved.items():
+        embed.add_field(name=f"{dict(PAYMENT_METHODS).get(method, '💳')} {method}",
+                        value=f"```\n{address}\n```Type `.{PAY_ALIASES[method][0]}` in a ticket", inline=True)
+    if not saved:
+        embed.description = "*Nothing saved yet.* Use `/set` to add one."
+    how = ("Type `.venmo`, `.cashapp`, `.paypal`, `.zelle`, `.applepay`, `.crypto` in a ticket — or `.pay` to send the "
+           "one the customer picked. You can also press **💸 Payment Info** or use `/pay`.")
+    if not TYPED_INPUT:
+        how += ("\n⚠️ Dot-commands need the **Message Content Intent** (Developer Portal → Bot). "
+                "Until then use **💸 Payment Info** or `/pay`.")
+    embed.add_field(name="💡 How to send it", value=how, inline=False)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    return stamp(embed, "Only you can send your own payment info")
+
+
+@app_commands.command(name="set", description="Save your payment info (Venmo, Cash App…) to send in tickets")
+@app_commands.describe(method="Payment app", address="Your payment address: phone number, $cashtag, @username, email or wallet")
+@app_commands.choices(method=PAY_CHOICES)
+@app_commands.guild_only()
+async def set_cmd(interaction: discord.Interaction, method: app_commands.Choice[str],
+                  address: app_commands.Range[str, 2, 100]):
+    address = address.replace("`", "").strip()
+    if len(address) < 2:
+        return await send_error(interaction, "That address is too short.")
+    g = store.guild(interaction.guild.id)
+    saved = g["payinfo"].setdefault(str(interaction.user.id), {})
+    old = saved.get(method.value)
+    saved[method.value] = address
+    store.save()
+    embed = saved_pay_embed(interaction.user, saved, "✅ Payment Info Saved")
+    embed.description = (f"**{method.value}** set to `{address}`" + (f" (was `{old}`)" if old and old != address else "")
+                         + f"\nNext time type **`.{PAY_ALIASES[method.value][0]}`** in a ticket and I'll send it.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@app_commands.command(name="unset", description="Delete one of your saved payment methods")
+@app_commands.choices(method=PAY_CHOICES)
+@app_commands.guild_only()
+async def unset_cmd(interaction: discord.Interaction, method: app_commands.Choice[str]):
+    g = store.guild(interaction.guild.id)
+    saved = g["payinfo"].get(str(interaction.user.id), {})
+    if saved.pop(method.value, None) is None:
+        return await send_error(interaction, f"You don't have **{method.value}** saved.")
+    store.save()
+    await interaction.response.send_message(
+        embed=saved_pay_embed(interaction.user, saved, f"🗑️ Removed {method.value}"), ephemeral=True)
+
+
+@app_commands.command(name="mypay", description="See the payment info you've saved")
+@app_commands.guild_only()
+async def mypay_cmd(interaction: discord.Interaction):
+    g = store.guild(interaction.guild.id)
+    await interaction.response.send_message(
+        embed=saved_pay_embed(interaction.user, saved_pay(g, interaction.user.id), "💸 Your Payment Info"),
+        ephemeral=True)
+
+
+@app_commands.command(name="pay", description="Send your saved payment info in this channel")
+@app_commands.describe(method="Which one (leave empty to send the customer's pick, or all of them)")
+@app_commands.choices(method=PAY_CHOICES)
+@app_commands.guild_only()
+async def pay_cmd(interaction: discord.Interaction, method: Optional[app_commands.Choice[str]] = None):
+    await ack(interaction)
+    error = await post_pay_info(interaction.channel, interaction.user, method.value if method else None)
+    if error:
+        return await send_error(interaction, error)
+    await finish(interaction, "✅ Payment info sent.")
+
+
 @app_commands.command(name="help", description="Show all Food and b4u bot commands")
 @app_commands.guild_only()
 async def help_cmd(interaction: discord.Interaction):
@@ -2231,6 +2410,8 @@ async def help_cmd(interaction: discord.Interaction):
         "`/close` — close & delete the ticket (transcript saved)\n"
         "`/orderinfo` — every detail of this order\n"
         "`/queue` — every order waiting / in progress\n"
+        "`/set` — save your payment info (e.g. Venmo → 973 202 0355) • `/mypay` · `/unset`\n"
+        "`/pay` or type `.venmo` `.cashapp` `.pay` … in a ticket — send YOUR saved payment info\n"
         "`/add` · `/remove` · `/rename` — manage the ticket"), inline=False)
     embed.add_field(name="🔘 Chef buttons (after claiming)", value=(
         "💰 **Payment Received** → 🛒 **Order Placed** → 🚗 **On The Way** → ✅ **Mark Complete**\n"
@@ -2243,7 +2424,7 @@ async def help_cmd(interaction: discord.Interaction):
 ALL_COMMANDS = [ticket_cmd, setchef_cmd, setlogs_cmd, panel_cmd, clockin_cmd, clockout_cmd, staffonline_cmd,
                 stats_cmd, leaderboard_cmd, claim_cmd, unclaim_cmd, complete_cmd, close_cmd, add_cmd,
                 remove_cmd, rename_cmd, orderinfo_cmd, blacklist_cmd, unblacklist_cmd, list_cmd, listadd_cmd,
-                listremove_cmd, queue_cmd, help_cmd]
+                listremove_cmd, queue_cmd, set_cmd, unset_cmd, mypay_cmd, pay_cmd, help_cmd]
 
 
 # ==========================================================================
@@ -2304,9 +2485,41 @@ class FoodBot(discord.Client):
         store.delete_ticket(channel.id)
         channel_locks.pop(channel.id, None)
 
+    async def on_error(self, event_method: str, *args, **kwargs) -> None:
+        log.exception("Error in %s - the bot keeps running", event_method)
+
+    async def handle_dot_command(self, message: discord.Message) -> bool:
+        """.venmo / .cashapp / .pay ... -> post the author's OWN saved payment info (chefs + owner only)."""
+        parts = message.content.strip()[1:].split()
+        word = parts[0].lower() if parts else ""
+        if word == "pay":
+            wanted = None
+        elif word in ALIAS_TO_METHOD:
+            wanted = ALIAS_TO_METHOD[word]
+        else:
+            return False
+        if not isinstance(message.author, discord.Member) or not can_use_commands(message.author,
+                                                                                  store.guild(message.guild.id)):
+            return False
+        error = await post_pay_info(message.channel, message.author, wanted)
+        if error:
+            await message.channel.send(embed=note(f"⚠️ {message.author.mention} {error}", COLOR_RED), delete_after=15)
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        return True
+
     async def on_message(self, message: discord.Message):
         if message.author.bot or message.guild is None:
             return
+        if message.content.startswith("."):
+            try:
+                if await self.handle_dot_command(message):
+                    return
+            except discord.HTTPException as exc:
+                log.warning("Dot-command failed in %s: %s", message.channel.id, exc)
+                return
         ticket = store.ticket(message.channel.id)
         if ticket is None or message.author.id != ticket["owner_id"]:
             return
@@ -2339,15 +2552,24 @@ class FoodBot(discord.Client):
 # ==========================================================================
 # Startup
 # ==========================================================================
-def preflight(token: str) -> Optional[dict]:
-    """Ask Discord about the app before connecting. Returns None if the check couldn't run."""
+LIMITED_INTENT_FLAGS = (1 << 13) | (1 << 15) | (1 << 19)   # presence / members / message-content (limited)
+
+
+def discord_api(token: str, method: str, path: str, body: Optional[dict] = None) -> dict:
     req = urllib.request.Request(
-        "https://discord.com/api/v10/oauth2/applications/@me",
-        headers={"Authorization": f"Bot {token}", "User-Agent": "DiscordBot (https://github.com/Rapptz/discord.py, 2)"},
+        f"https://discord.com/api/v10{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json",
+                 "User-Agent": "DiscordBot (https://github.com/Rapptz/discord.py, 2)"},
     )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.load(resp)
+
+
+def preflight(token: str) -> Optional[dict]:
+    """Check the app before connecting and switch on the Message Content intent if it's off."""
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.load(resp)
+        data = discord_api(token, "GET", "/applications/@me")
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             return {"invalid": True}
@@ -2356,11 +2578,23 @@ def preflight(token: str) -> Optional[dict]:
     except Exception as exc:  # network / SSL problems: just skip the pre-check
         log.warning("Pre-check skipped (%s) - continuing", exc)
         return None
+    flags = int(data.get("flags", 0))
+    message_content = bool(flags & INTENT_MESSAGE_CONTENT)
+    if not message_content:
+        # Bots in under 100 servers may enable the limited intent themselves (same as the portal toggle).
+        try:
+            result = discord_api(token, "PATCH", "/applications/@me",
+                                 {"flags": (flags & LIMITED_INTENT_FLAGS) | (1 << 19)})
+            message_content = bool(int(result.get("flags", 0)) & INTENT_MESSAGE_CONTENT)
+            if message_content:
+                log.info("Turned ON the Message Content intent (needed for typed answers and .venmo commands).")
+        except Exception as exc:
+            log.warning("Couldn't switch on the Message Content intent automatically (%s).", exc)
     return {
         "invalid": False,
         "name": data.get("name"),
-        "message_content": bool(int(data.get("flags", 0)) & INTENT_MESSAGE_CONTENT),
-        "guilds": data.get("bot_approximate_guild_count"),
+        "message_content": message_content,
+        "guilds": data.get("approximate_guild_count", data.get("bot_approximate_guild_count")),
     }
 
 
@@ -2372,6 +2606,51 @@ def pause_before_exit() -> None:
             pass
 
 
+def disable_quick_edit() -> None:
+    """Windows: clicking inside the console normally FREEZES the program until a key is pressed
+    (the bot goes offline 'for a bit'). Turn that selection mode off."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, (mode.value & ~0x0040) | 0x0080)   # -QUICK_EDIT, +EXTENDED_FLAGS
+    except Exception:
+        pass
+
+
+_instance_socket: Optional[socket.socket] = None
+
+
+def claim_single_instance() -> bool:
+    """Two copies of the bot answer every button twice and throw errors. Allow only one."""
+    global _instance_socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        sock.listen(1)
+    except OSError:
+        sock.close()
+        return False
+    _instance_socket = sock
+    return True
+
+
+def setup_logs() -> None:
+    discord.utils.setup_logging(level=logging.INFO)
+    try:
+        handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("[{asctime}] [{levelname:<8}] {name}: {message}",
+                                               "%Y-%m-%d %H:%M:%S", style="{"))
+        logging.getLogger().addHandler(handler)
+    except OSError:
+        pass
+    logging.getLogger("discord.gateway").setLevel(logging.WARNING)   # hide routine reconnect chatter
+
+
 def main() -> None:
     global TYPED_INPUT
     try:
@@ -2379,46 +2658,64 @@ def main() -> None:
         sys.stderr.reconfigure(errors="replace")
     except (AttributeError, ValueError):
         pass
-    discord.utils.setup_logging(level=logging.INFO)
+    setup_logs()
+    disable_quick_edit()
     discord.VoiceClient.warn_nacl = False     # no voice features used - hide noisy warnings
     discord.VoiceClient.warn_dave = False
 
     if discord.version_info < (2, 7, 0):
         log.error("discord.py %s is too old. Run:  pip install -U \"discord.py>=2.7\"", discord.__version__)
         return pause_before_exit()
-
     if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         log.error("No token. Paste your bot token into TOKEN at the top of main.py.")
+        return pause_before_exit()
+    if not claim_single_instance():
+        log.error("The bot is ALREADY RUNNING in another window. Close that one first (running two copies causes errors).")
         return pause_before_exit()
 
     info = preflight(TOKEN)
     if info and info["invalid"]:
         log.error("Discord rejected the token. Developer Portal -> Bot -> Reset Token, then paste the new one.")
         return pause_before_exit()
-
-    attempts = [True, False]
+    use_mc = True
     if info is not None:
+        use_mc = info["message_content"]
         log.info("App '%s' found. Message Content Intent: %s. Servers: %s", info["name"],
-                 "ENABLED" if info["message_content"] else "disabled", info["guilds"])
-        if not info["message_content"]:
-            log.warning("Message Content Intent is OFF -> customers answer with pop-up forms. "
-                        "To also allow typed answers: Developer Portal -> Bot -> MESSAGE CONTENT INTENT -> Save.")
-            attempts = [False]
+                 "ENABLED" if use_mc else "disabled", info["guilds"])
+        if not use_mc:
+            log.warning("Message Content Intent is OFF -> pop-up forms only, and .venmo commands won't work. "
+                        "Turn it on: Developer Portal -> Bot -> MESSAGE CONTENT INTENT -> Save.")
+    log.info("Logs are also saved to %s", LOG_FILE.name)
 
-    for use_mc in attempts:
+    failures = 0
+    while True:   # supervisor: if the bot ever crashes, it restarts itself
         TYPED_INPUT = use_mc
         bot = FoodBot(message_content=use_mc)
+        started = time.monotonic()
         try:
             bot.run(TOKEN, log_handler=None)
-            return
+            log.info("Bot stopped.")
+            break                                   # Ctrl+C / normal shutdown
         except discord.PrivilegedIntentsRequired:
+            if not use_mc:
+                log.error("Discord refused the connection (intents). Check the Developer Portal settings.")
+                break
             log.warning("Message Content Intent isn't enabled - restarting in forms-only mode.")
+            use_mc = False
             continue
         except discord.LoginFailure:
             log.error("Discord rejected the token. Developer Portal -> Bot -> Reset Token, then paste the new one.")
             break
+        except KeyboardInterrupt:
+            break
         except Exception:
-            log.error("Bot crashed:\n%s", traceback.format_exc())
+            log.error("Bot crashed - it will restart by itself:\n%s", traceback.format_exc())
+        failures = 0 if time.monotonic() - started > 300 else failures + 1
+        delay = min(60, 5 * 2 ** min(failures, 4))
+        log.warning("Restarting in %d seconds... (close the window or press Ctrl+C to stop)", delay)
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
             break
     pause_before_exit()
 

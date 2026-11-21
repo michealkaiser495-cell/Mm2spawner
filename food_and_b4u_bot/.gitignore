@@ -3,3 +3,4 @@ foodandb4u_data.json
 *.tmp
 *.corrupt.json
 .env
+foodb4u.log*
