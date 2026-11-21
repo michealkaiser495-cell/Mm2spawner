@@ -1,5 +1,5 @@
 """
-Food and b4u Order Desk v5 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v6 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -28,6 +28,7 @@ import socket
 import sys
 import time
 import traceback
+import types
 import urllib.error
 import urllib.request
 from logging.handlers import RotatingFileHandler
@@ -48,6 +49,7 @@ CURRENCY = "$"
 PRICE_DIVISOR = Decimal(3)              # customer pays 1/3 of the order total
 MAX_ORDER_TOTAL = Decimal("100000")
 CLOSE_DELAY_SECONDS = 5
+FREE_ORDER_STARS = 10                   # vouch stars needed for /free order
 TICKET_COOLDOWN_SECONDS = 10
 DATA_FILE = Path(__file__).with_name("foodandb4u_data.json")
 LOG_FILE = Path(__file__).with_name("foodb4u.log")
@@ -114,7 +116,10 @@ class Store:
         "completion_seconds": 0, # total claim->complete time, for the average
         "customers": {},         # {user_id: {"orders": int, "spent": str}}
         "blacklist": {},         # {user_id: reason}
-        "payinfo": {},           # {user_id: {method: address}}  saved with /set
+        "payinfo": {},           # {user_id: {method: address}}  saved with /set payment
+        "buyer_role": None,      # given to customers when their order is completed (/buyer)
+        "vouch_channel": None,   # where vouches are posted (/set vouch)
+        "vouch_counter": 0,
         "restaurants": DEFAULT_RESTAURANTS,   # 3 columns shown by /list
         "counter": 0,
     }
@@ -177,6 +182,9 @@ class Store:
         c = self.guild(guild_id)["customers"].setdefault(str(user_id), {})
         c.setdefault("orders", 0)
         c.setdefault("spent", "0")
+        c.setdefault("stars", 0)
+        c.setdefault("vouches", 0)
+        c.setdefault("free_orders", 0)
         return c
 
     def ticket(self, channel_id: int) -> Optional[dict]:
@@ -444,6 +452,8 @@ def panel_embed(guild: Optional[discord.Guild], g: dict) -> discord.Embed:
     embed.add_field(name="📦 Orders Completed", value=f"**{done:,}**", inline=True)
     embed.add_field(name="⚡ Avg. Completion", value=avg, inline=True)
     embed.add_field(name="⭐ Customer Rating", value=rating_text(rsum, rcount), inline=True)
+    embed.add_field(name="🎁 Rewards", value=(f"Leave a vouch after every order = **+1 ⭐** • "
+                                             f"**{FREE_ORDER_STARS} ⭐ = FREE order**"), inline=False)
     embed.add_field(name="💰 You Pay", value=(
         f"**{PRICE_RULE}** — tax & delivery included\n"
         f"Example: {short_money(Decimal(45))} order → you pay **{short_money(customer_share(Decimal(45)))}** • "
@@ -578,7 +588,7 @@ def summary_embed(t: dict, image_name: Optional[str]) -> discord.Embed:
     embed.add_field(name="🏠 Delivery Details", value=location_lines(t), inline=False)
     embed.add_field(name="📋 Restaurant Check", value=menu_check_text(t), inline=False)
     embed.add_field(name="🧾 Order Total", value=money(Decimal(t["total"])), inline=True)
-    embed.add_field(name="💵 Customer Pays", value=f"**{money(Decimal(t['due']))}**", inline=True)
+    embed.add_field(name="💵 Customer Pays", value=pays_text(t), inline=True)
     embed.add_field(name="💳 Payment", value=payment_text(t), inline=True)
     embed.add_field(name="💰 Payment Status", value=paid_text(t), inline=True)
     embed.add_field(name="👥 Customer History", value=customer_history(store.guild(t["guild_id"]), t["owner_id"]),
@@ -629,9 +639,36 @@ def rating_text(rsum: int, rcount: int) -> str:
 
 def customer_history(g: dict, user_id: int) -> str:
     c = g["customers"].get(str(user_id))
+    stars_part = f" • ⭐ {c.get('stars', 0)}/{FREE_ORDER_STARS} stars" if c else ""
     if not c or not c.get("orders"):
-        return "🆕 First order"
-    return f"🔁 Returning — **{c['orders']}** order(s) • {money(Decimal(c['spent']))} paid"
+        return "🆕 First order" + stars_part
+    return f"🔁 Returning — **{c['orders']}** order(s) • {money(Decimal(c['spent']))} paid" + stars_part
+
+
+def star_bar(n: int) -> str:
+    filled = max(0, min(n, FREE_ORDER_STARS))
+    return "⭐" * filled + "⚫" * (FREE_ORDER_STARS - filled)
+
+
+def stars_line(c: dict) -> str:
+    n = c.get("stars", 0)
+    tail = ("🎁 **FREE order ready!** Use `/free order` in your next ticket." if n >= FREE_ORDER_STARS
+            else f"**{FREE_ORDER_STARS - n}** more vouch(es) for a **FREE order** 🎁")
+    return f"{star_bar(n)}\n**{n}/{FREE_ORDER_STARS}** stars — {tail}"
+
+
+def pays_text(t: dict) -> str:
+    if t.get("free"):
+        return f"🎁 **FREE ORDER** ({FREE_ORDER_STARS} ⭐)"
+    return f"**{money(Decimal(t['due']))}**" if t.get("due") else "—"
+
+
+def owner_pings(guild: discord.Guild) -> str:
+    """Server owner + every (non-bot) role with Administrator."""
+    pings = [f"<@{guild.owner_id}>"]
+    pings += [r.mention for r in guild.roles
+              if r.permissions.administrator and not r.managed and not r.is_default()]
+    return " ".join(pings)
 
 
 def note(text: str, color: int = COLOR_ORANGE, extra: Optional[str] = None) -> discord.Embed:
@@ -1048,8 +1085,6 @@ class RateView(SafeView):
         await do_rate(interaction, 5)
 
 
-PERSISTENT_VIEWS = (PanelView, ListView, CloseConfirmView, TicketControlView, AddressStepView, ShotStepView, PayStepView,
-                    AddressConfirmView, ClaimView, ClaimedView, RateView)
 
 
 # ==========================================================================
@@ -1198,6 +1233,10 @@ async def apply_address(channel, ticket: dict, restaurant: Optional[str], addres
 
 async def apply_screenshot_and_total(channel, ticket: dict) -> None:
     await retire_step(channel, ticket, "Screenshot & total received")
+    if ticket.get("free"):
+        ticket["due"] = "0.00"
+        await apply_payment(channel, ticket, f"🎁 Free order — {FREE_ORDER_STARS} ⭐ redeemed")
+        return
     total = Decimal(ticket["total"])
     due = customer_share(total)
     ticket.update(due=str(due), stage="payment")
@@ -1323,6 +1362,8 @@ async def send_order_summary(channel: discord.TextChannel, ticket: dict) -> None
     file: Optional[discord.File] = None
     jump: Optional[str] = None
     try:
+        if not ticket.get("screenshot_msg_id"):
+            raise discord.NotFound(types.SimpleNamespace(status=404, reason="no screenshot"), "no screenshot")
         shot_msg = await channel.fetch_message(ticket["screenshot_msg_id"])
         jump = shot_msg.jump_url
         images = image_attachments(shot_msg)
@@ -1392,7 +1433,8 @@ async def update_summary(channel, ticket: dict, view: discord.ui.View) -> None:
     if not ticket.get("summary_msg_id"):
         return
     live = {"📌 Status": order_status(ticket), "🧭 Timeline": timeline_text(ticket),
-            "💰 Payment Status": paid_text(ticket)}
+            "💰 Payment Status": "🎁 Free order — nothing to pay" if ticket.get("free") else paid_text(ticket),
+            "💵 Customer Pays": pays_text(ticket)}
     try:
         msg = await channel.fetch_message(ticket["summary_msg_id"])
         if not msg.embeds:
@@ -1560,6 +1602,7 @@ async def do_complete(interaction: discord.Interaction) -> None:
         if ticket.get("due"):
             c["spent"] = str(Decimal(c["spent"]) + Decimal(ticket["due"]))
         store.save()
+        buyer_note = await give_buyer_role(guild, ticket["owner_id"])
         embed = discord.Embed(
             title="✅ Order Complete",
             description=(f"This order from {mention(ticket['owner_id'])} has been done by {mention(chef)}. 🎉\n\n"
@@ -1576,17 +1619,26 @@ async def do_complete(interaction: discord.Interaction) -> None:
         embed.add_field(name="⏱️ Time to complete", value=duration(took), inline=True)
         embed.add_field(name="🏆 Chef's orders", value=str(s["orders"]), inline=True)
         embed.add_field(name="👥 Your orders with us", value=str(c["orders"]), inline=True)
+        if ticket.get("free"):
+            embed.add_field(name="🎁 Free Order", value=f"Paid with **{FREE_ORDER_STARS} ⭐** — enjoy!", inline=False)
+        if buyer_note:
+            embed.add_field(name="🛍️ Buyer Role", value=buyer_note, inline=False)
         embed.add_field(name="🧭 Timeline", value=timeline_text(ticket), inline=False)
         stamp(embed, f"Order #{ticket['number']:04d}")
         await channel.send(content=mention(ticket["owner_id"]), embed=embed, view=TicketControlView(),
                            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
-        rate = discord.Embed(
-            title="⭐ How was your order?",
-            description=(f"{mention(ticket['owner_id'])}, rate your experience with {mention(chef)} "
-                         "by pressing **1–5** below. It helps us keep the food (and service) great! 🍔"),
+        prompt = discord.Embed(
+            title="⭐ Leave a Vouch & Earn Stars!",
+            description=(f"{mention(ticket['owner_id'])}, how was your order with {mention(chef)}?\n"
+                         "Press **Leave a Vouch**, pick your stars and upload a **screenshot of your order** "
+                         "(the food / delivery confirmation).\n\n"
+                         f"🎁 Every vouch = **+1 ⭐** • **{FREE_ORDER_STARS} ⭐ = a FREE order** (`/free order`)"),
             color=COLOR_GOLD,
         )
-        await channel.send(embed=stamp(rate, f"Order #{ticket['number']:04d}"), view=RateView())
+        prompt.add_field(name="⭐ Your Stars", value=stars_line(c), inline=False)
+        vouch_msg = await channel.send(embed=stamp(prompt, f"Order #{ticket['number']:04d}"), view=VouchView())
+        ticket["vouch_msg_id"] = vouch_msg.id
+        store.set_ticket(channel.id, ticket)
 
         # receipt DM to the customer (ignored if their DMs are closed)
         try:
@@ -1651,7 +1703,9 @@ async def do_progress(interaction: discord.Interaction, step: str) -> None:
 
         chef, customer = mention(ticket["claimed_by"]), mention(ticket["owner_id"])
         where = ticket.get("restaurant") or "the restaurant"
-        if step == "paid":
+        if step == "paid" and ticket.get("free"):
+            text = f"🎁 This is a **FREE order** — nothing to pay. {chef} is placing it next!"
+        elif step == "paid":
             due = money(Decimal(ticket["due"])) if ticket.get("due") else "your payment"
             text = (f"{chef} confirmed your payment of **{due}** via **{payment_text(ticket)}**. ✅\n"
                     "Your order is being placed next!")
@@ -1758,11 +1812,13 @@ async def post_pay_info(channel, chef: discord.Member, wanted: Optional[str] = N
     g = store.guild(channel.guild.id)
     saved = saved_pay(g, chef.id)
     if not saved:
-        return "You haven't saved any payment info yet. Use `/set` first — e.g. `/set method:Venmo address:973 202 0355`."
+        return "You haven't saved any payment info yet. Use `/set payment` first — e.g. `/set payment method:Venmo address:973 202 0355`."
     ticket = store.ticket(channel.id)
+    if ticket and ticket.get("free"):
+        return "This is a 🎁 **FREE order** — the customer doesn't pay anything."
     methods = pick_methods(saved, ticket, wanted)
     if not methods:
-        return f"You haven't saved **{wanted}** yet. Use `/set` to add it. You have: {', '.join(saved)}."
+        return f"You haven't saved **{wanted}** yet. Use `/set payment` to add it. You have: {', '.join(saved)}."
     await channel.send(content=mention(ticket["owner_id"]) if ticket else None,
                        embed=pay_info_embed(chef, methods, ticket),
                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
@@ -1781,6 +1837,162 @@ async def do_payinfo(interaction: discord.Interaction) -> None:
     error = await post_pay_info(interaction.channel, interaction.user)
     if error:
         await send_error(interaction, error)
+
+
+async def give_buyer_role(guild: discord.Guild, user_id: int) -> Optional[str]:
+    g = store.guild(guild.id)
+    role = guild.get_role(g["buyer_role"]) if g["buyer_role"] else None
+    if role is None:
+        return None
+    try:
+        member = guild.get_member(user_id) or await guild.fetch_member(user_id)
+        if role in member.roles:
+            return f"You already have {role.mention} ✅"
+        await member.add_roles(role, reason=f"{BRAND}: order completed")
+        return f"You got the {role.mention} role! 🎉"
+    except discord.Forbidden:
+        log.warning("Can't give buyer role %s - bot role must be above it", role.name)
+        return f"⚠️ I couldn't give {role.mention} — the owner must drag my bot role **above** it (Server Settings → Roles)."
+    except discord.HTTPException as exc:
+        log.warning("Buyer role failed: %s", exc)
+        return None
+
+
+STAR_LABELS = {5: "Perfect — amazing order!", 4: "Great order", 3: "Good", 2: "Could be better", 1: "Bad experience"}
+
+
+def vouch_guard(ticket: Optional[dict], user_id: int) -> Optional[str]:
+    if ticket is None:
+        return "This ticket no longer exists."
+    if user_id != ticket["owner_id"]:
+        return "Only the customer who ordered can vouch for this order."
+    if not ticket.get("completed"):
+        return "You can vouch once your order is complete."
+    if ticket.get("vouched") or ticket.get("rating"):
+        return "You already vouched for this order. Thank you! 💛"
+    return None
+
+
+class VouchModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="⭐ Leave a Vouch", timeout=900)
+        self.stars = discord.ui.Select(placeholder="How many stars?", options=[
+            discord.SelectOption(label=f"{n} star{'s' if n > 1 else ''}", value=str(n), emoji="⭐",
+                                 description=STAR_LABELS[n]) for n in (5, 4, 3, 2, 1)])
+        self.shot = discord.ui.FileUpload(required=True, min_values=1, max_values=1)
+        self.comment = discord.ui.TextInput(style=discord.TextStyle.paragraph, required=False, max_length=300,
+                                            placeholder="Fast, hot food, great chef… (optional)")
+        self.add_item(discord.ui.Label(text="Rating", description="Pick 1–5 stars", component=self.stars))
+        self.add_item(discord.ui.Label(text="Screenshot of your order",
+                                       description="Your food / the delivery confirmation", component=self.shot))
+        self.add_item(discord.ui.Label(text="Comment", description="Say something about your order",
+                                       component=self.comment))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        score = int(self.stars.values[0]) if self.stars.values else 5
+        await submit_vouch(interaction, score, self.shot.values, self.comment.value.strip())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("VouchModal failed", exc_info=error)
+        await send_error(interaction, "Something went wrong posting your vouch. Please try again.")
+
+
+class VouchView(SafeView):
+    def __init__(self, done: bool = False):
+        super().__init__(timeout=None)
+        if done:
+            self.vouch.disabled = True
+            self.vouch.label = "Vouched — thank you!"
+            self.vouch.style = discord.ButtonStyle.secondary
+
+    @discord.ui.button(label="Leave a Vouch", emoji="⭐", style=discord.ButtonStyle.success,
+                       custom_id="fb4u:vouch:open")
+    async def vouch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        problem = vouch_guard(store.ticket(interaction.channel.id), interaction.user.id)
+        if problem:
+            return await send_error(interaction, problem)
+        await interaction.response.send_modal(VouchModal())
+
+
+def vouch_embed(number: int, score: int, customer: discord.abc.User, ticket: dict, comment: str,
+                c: dict) -> discord.Embed:
+    embed = discord.Embed(title=f"⭐ Vouch #{number:04d}",
+                          description=f"# {stars(score)}\n**{score}/5** — {STAR_LABELS[score]}",
+                          color=COLOR_GOLD)
+    embed.add_field(name="👤 Customer", value=customer.mention, inline=True)
+    embed.add_field(name="🧑‍🍳 Chef", value=mention(ticket.get("claimed_by")), inline=True)
+    embed.add_field(name="🆔 Order", value=f"#{ticket['number']:04d}", inline=True)
+    place = restaurant_guess(ticket)
+    if place:
+        embed.add_field(name="🍔 Restaurant", value=(menu_match(store.guild(ticket["guild_id"]), place) or place)[:1024],
+                        inline=True)
+    if ticket.get("free"):
+        embed.add_field(name="🎁 Order", value="FREE order (stars)", inline=True)
+    if comment:
+        embed.add_field(name="💬 Comment", value=f">>> {comment}"[:1024], inline=False)
+    embed.add_field(name="🎁 Stars", value=f"{customer.mention} got **+1 ⭐** — now has **{c['stars']}** ⭐\n"
+                                          f"{star_bar(c['stars'])}", inline=False)
+    embed.set_thumbnail(url=customer.display_avatar.url)
+    return stamp(embed, f"{c['vouches']} vouch(es) from this customer")
+
+
+async def submit_vouch(interaction: discord.Interaction, score: int, uploads: list, comment: str) -> None:
+    channel = interaction.channel
+    await ack(interaction)
+    async with lock_for(channel.id):
+        ticket = store.ticket(channel.id)
+        problem = vouch_guard(ticket, interaction.user.id)
+        if problem:
+            return await send_error(interaction, problem)
+        images = [a for a in uploads if is_image(a)]
+        if not images:
+            return await send_error(interaction, "That file isn't an image. Upload a **screenshot** (PNG/JPG).")
+        guild = channel.guild
+        g = store.guild(guild.id)
+        g["vouch_counter"] += 1
+        number = g["vouch_counter"]
+        c = store.customer(guild.id, ticket["owner_id"])
+        c["stars"] += 1
+        c["vouches"] += 1
+        if ticket.get("claimed_by"):
+            s = store.stats(guild.id, ticket["claimed_by"])
+            s["rating_sum"] += score
+            s["rating_count"] += 1
+        ticket.update(vouched=True, rating=score)
+        store.save()
+        store.set_ticket(channel.id, ticket)
+
+        embed = vouch_embed(number, score, interaction.user, ticket, comment, c)
+        posted = None
+        vch = guild.get_channel(g["vouch_channel"]) if g["vouch_channel"] else None
+        if isinstance(vch, discord.TextChannel):
+            att = images[0]
+            ext = os.path.splitext(att.filename)[1].lower() or ".png"
+            try:
+                file = await att.to_file(filename=f"vouch_{number:04d}{ext}")
+                embed.set_image(url=f"attachment://{file.filename}")
+                posted = await vch.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException as exc:
+                log.warning("Vouch post failed: %s", exc)
+
+        if ticket.get("vouch_msg_id"):
+            try:
+                await channel.get_partial_message(ticket["vouch_msg_id"]).edit(view=VouchView(done=True))
+            except discord.HTTPException:
+                pass
+        thanks = discord.Embed(
+            title="🙏 Thanks for the vouch!",
+            description=(f"{interaction.user.mention} gave {mention(ticket.get('claimed_by'))} **{stars(score)}** "
+                         f"and earned **+1 ⭐**!"),
+            color=COLOR_GOLD,
+        )
+        thanks.add_field(name="⭐ Your Stars", value=stars_line(c), inline=False)
+        if posted:
+            thanks.add_field(name="📣 Posted", value=f"[See your vouch in {vch.mention}]({posted.jump_url})", inline=False)
+        elif not vch:
+            thanks.add_field(name="📣 Posted", value="*No vouch channel set yet — the owner can use `/set vouch`.*",
+                             inline=False)
+        await channel.send(embed=stamp(thanks, f"Order #{ticket['number']:04d}"))
 
 
 def check_can_close(member: discord.Member, ticket: dict) -> None:
@@ -1879,6 +2091,9 @@ async def close_ticket(channel: discord.TextChannel, closer: discord.Member, rea
 # ==========================================================================
 # Command tree: only owners/admins and chefs may use slash commands
 # ==========================================================================
+PUBLIC_COMMANDS = {"free", "stars"}      # everyone can use these; all others are owner/chef only
+
+
 class GatedTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.type == discord.InteractionType.autocomplete:
@@ -1888,7 +2103,7 @@ class GatedTree(app_commands.CommandTree):
             await send_error(interaction, "Commands only work inside a server.")
             return False
         g = store.guild(interaction.guild.id)
-        if can_use_commands(interaction.user, g):
+        if can_use_commands(interaction.user, g) or (interaction.data or {}).get("name") in PUBLIC_COMMANDS:
             return True
         await send_error(interaction, f"🔒 Commands are only for the **server owner** and "
                                       f"{role_mention(g['chef_role'])}.")
@@ -2323,7 +2538,7 @@ def saved_pay_embed(member: discord.Member, saved: dict, title: str) -> discord.
         embed.add_field(name=f"{dict(PAYMENT_METHODS).get(method, '💳')} {method}",
                         value=f"```\n{address}\n```Type `.{PAY_ALIASES[method][0]}` in a ticket", inline=True)
     if not saved:
-        embed.description = "*Nothing saved yet.* Use `/set` to add one."
+        embed.description = "*Nothing saved yet.* Use `/set payment` to add one."
     how = ("Type `.venmo`, `.cashapp`, `.paypal`, `.zelle`, `.applepay`, `.crypto` in a ticket — or `.pay` to send the "
            "one the customer picked. You can also press **💸 Payment Info** or use `/pay`.")
     if not TYPED_INPUT:
@@ -2334,10 +2549,13 @@ def saved_pay_embed(member: discord.Member, saved: dict, title: str) -> discord.
     return stamp(embed, "Only you can send your own payment info")
 
 
-@app_commands.command(name="set", description="Save your payment info (Venmo, Cash App…) to send in tickets")
+set_group = app_commands.Group(name="set", description="Save your payment info or the vouch channel",
+                               guild_only=True)
+
+
+@set_group.command(name="payment", description="Save your payment info (Venmo, Cash App…) to send in tickets")
 @app_commands.describe(method="Payment app", address="Your payment address: phone number, $cashtag, @username, email or wallet")
 @app_commands.choices(method=PAY_CHOICES)
-@app_commands.guild_only()
 async def set_cmd(interaction: discord.Interaction, method: app_commands.Choice[str],
                   address: app_commands.Range[str, 2, 100]):
     address = address.replace("`", "").strip()
@@ -2352,6 +2570,23 @@ async def set_cmd(interaction: discord.Interaction, method: app_commands.Choice[
     embed.description = (f"**{method.value}** set to `{address}`" + (f" (was `{old}`)" if old and old != address else "")
                          + f"\nNext time type **`.{PAY_ALIASES[method.value][0]}`** in a ticket and I'll send it.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@set_group.command(name="vouch", description="Pick the channel where vouches are posted")
+@app_commands.describe(channel="The vouches channel")
+@owner_only()
+async def set_vouch_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    g = store.guild(interaction.guild.id)
+    g["vouch_channel"] = channel.id
+    store.save()
+    embed = discord.Embed(title="⭐ Vouch Channel Set", color=COLOR_GOLD,
+                          description=(f"Vouches will be posted in {channel.mention}.\n\n"
+                                       "After an order is completed the customer presses **Leave a Vouch**, picks "
+                                       "1–5 stars and uploads a screenshot. Each vouch gives them **+1 ⭐**; "
+                                       f"**{FREE_ORDER_STARS} ⭐** = a FREE order with `/free order`."))
+    embed.add_field(name="🛍️ Buyer Role", value=role_mention(g["buyer_role"]) + ("" if g["buyer_role"] else
+                                                                                 " — set it with `/buyer`"), inline=True)
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
 @app_commands.command(name="unset", description="Delete one of your saved payment methods")
@@ -2388,6 +2623,139 @@ async def pay_cmd(interaction: discord.Interaction, method: Optional[app_command
     await finish(interaction, "✅ Payment info sent.")
 
 
+@app_commands.command(name="buyer", description="Set the role customers get when their order is completed")
+@app_commands.describe(role="The buyer role")
+@app_commands.guild_only()
+@owner_only()
+async def buyer_cmd(interaction: discord.Interaction, role: discord.Role):
+    if role.managed or role.is_default():
+        return await send_error(interaction, "Pick a normal role (not @everyone or a bot role).")
+    g = store.guild(interaction.guild.id)
+    g["buyer_role"] = role.id
+    store.save()
+    me = interaction.guild.me
+    warn = "" if me.top_role > role else ("\n\n⚠️ My bot role is **below** this role, so I can't give it yet. "
+                                          "Drag my role above it in Server Settings → Roles.")
+    embed = discord.Embed(title="🛍️ Buyer Role Set", color=COLOR_GREEN,
+                          description=(f"Customers get {role.mention} automatically when their order is completed.\n"
+                                       f"Only buyers can use `/free order` (with {FREE_ORDER_STARS} ⭐).{warn}"))
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+
+@app_commands.command(name="stars", description="See how many vouch stars you have")
+@app_commands.describe(member="Check someone else (chefs/owner only)")
+@app_commands.guild_only()
+async def stars_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    g = store.guild(interaction.guild.id)
+    target = member or interaction.user
+    if target.id != interaction.user.id and not can_use_commands(interaction.user, g):
+        return await send_error(interaction, "You can only check your own stars.")
+    c = store.customer(interaction.guild.id, target.id)
+    embed = discord.Embed(title=f"⭐ Stars — {target.display_name}", color=COLOR_GOLD,
+                          description=stars_line(c))
+    embed.add_field(name="📝 Vouches", value=str(c["vouches"]), inline=True)
+    embed.add_field(name="🛍️ Orders", value=str(c["orders"]), inline=True)
+    embed.add_field(name="🎁 Free orders used", value=str(c["free_orders"]), inline=True)
+    embed.add_field(name="💡 How it works", value=(f"Leave a vouch after every completed order = **+1 ⭐**.\n"
+                                                   f"At **{FREE_ORDER_STARS} ⭐** open an order ticket and type "
+                                                   "`/free order`."), inline=False)
+    embed.set_thumbnail(url=target.display_avatar.url)
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+
+@app_commands.command(name="givestars", description="Add or remove vouch stars from a member")
+@app_commands.describe(member="Who", amount="How many (use a negative number to remove)")
+@app_commands.guild_only()
+@owner_only()
+async def givestars_cmd(interaction: discord.Interaction, member: discord.Member,
+                        amount: app_commands.Range[int, -100, 100]):
+    c = store.customer(interaction.guild.id, member.id)
+    c["stars"] = max(0, c["stars"] + amount)
+    store.save()
+    embed = discord.Embed(title="⭐ Stars Updated", color=COLOR_GOLD,
+                          description=f"{'Gave' if amount >= 0 else 'Removed'} **{abs(amount)}** ⭐ "
+                                      f"{'to' if amount >= 0 else 'from'} {member.mention}.\n\n{stars_line(c)}")
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+
+free_group = app_commands.Group(name="free", description="Rewards — redeem your vouch stars", guild_only=True)
+
+
+@free_group.command(name="order", description=f"Use {FREE_ORDER_STARS} vouch stars to make this order FREE")
+async def free_order_cmd(interaction: discord.Interaction):
+    channel, user = interaction.channel, interaction.user
+    g = store.guild(interaction.guild.id)
+    ticket = store.ticket(channel.id) if channel else None
+    if ticket is None or ticket["kind"] == "support":
+        return await send_error(interaction, "Use `/free order` inside your **order ticket** "
+                                             "(open one with **Create Order** first).")
+    if user.id != ticket["owner_id"]:
+        return await send_error(interaction, "Only the customer who opened this ticket can redeem a free order.")
+    if g["buyer_role"] and not has_role(user, g["buyer_role"]) and not is_owner(user):
+        return await send_error(interaction, f"You need the {role_mention(g['buyer_role'])} role — "
+                                             "you get it after your first completed order.")
+    if ticket.get("free"):
+        return await send_error(interaction, "This order is already a 🎁 **FREE order**.")
+    if ticket.get("completed"):
+        return await send_error(interaction, "This order is already completed — use `/free order` on your next one.")
+    c = store.customer(interaction.guild.id, user.id)
+    if c["stars"] < FREE_ORDER_STARS:
+        embed = discord.Embed(title="⭐ Not enough stars yet", color=COLOR_ORANGE, description=stars_line(c))
+        embed.add_field(name="💡 Earn stars", value="Leave a **vouch** after every completed order = **+1 ⭐**.",
+                        inline=False)
+        return await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+    await ack(interaction)
+    async with lock_for(channel.id):
+        ticket = store.ticket(channel.id)
+        if ticket is None or ticket.get("free"):
+            return await send_error(interaction, "This order is already a 🎁 **FREE order**.")
+        c["stars"] -= FREE_ORDER_STARS
+        c["free_orders"] += 1
+        ticket.update(free=True, free_at=int(time.time()))
+        if ticket.get("due"):
+            ticket["due"] = "0.00"
+        store.save()
+        store.set_ticket(channel.id, ticket)
+
+        new_name = f"{slugify(user.name)}-free-order"
+        renamed = True
+        try:
+            await channel.edit(name=new_name, reason=f"{BRAND}: free order redeemed by {user}")
+        except discord.HTTPException as exc:
+            renamed = False
+            log.warning("Free-order rename failed: %s", exc)
+
+        if ticket["stage"] in ("address", "confirm", "screenshot"):
+            next_step = "Finish the steps above — when you send your total you **won't be charged**."
+        elif ticket["stage"] == "payment":
+            next_step = "Skipping payment — your order goes straight to the kitchen. 🔥"
+        else:
+            next_step = "Your order is already with the kitchen — the price is now **$0.00**."
+        embed = discord.Embed(
+            title="🎁 FREE ORDER REDEEMED!",
+            description=(f"{user.mention} just cashed in **{FREE_ORDER_STARS} ⭐** for a **FREE order**! 🎉\n"
+                         f"Owners — this order is on the house."),
+            color=COLOR_GOLD,
+        )
+        embed.add_field(name="👤 Customer", value=user.mention, inline=True)
+        embed.add_field(name="🆔 Order", value=f"#{ticket['number']:04d}", inline=True)
+        embed.add_field(name="🎁 Free orders used", value=str(c["free_orders"]), inline=True)
+        embed.add_field(name="⭐ Stars left", value=stars_line(c), inline=False)
+        embed.add_field(name="🏷️ Ticket", value=f"Renamed to `{new_name}`" if renamed else "*Couldn't rename the channel*",
+                        inline=True)
+        embed.add_field(name="📋 What happens now", value=next_step, inline=False)
+        embed.set_thumbnail(url=user.display_avatar.url)
+        await channel.send(content=f"🎁 {owner_pings(channel.guild)}", embed=stamp(embed, f"Order #{ticket['number']:04d}"),
+                           allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=False))
+
+        if ticket["stage"] == "payment":
+            await apply_payment(channel, ticket, f"🎁 Free order — {FREE_ORDER_STARS} ⭐ redeemed")
+        elif ticket.get("summary_msg_id"):
+            await update_summary(channel, ticket, ClaimView(claimed=bool(ticket.get("claimed_by"))))
+    await finish(interaction, "🎉 Free order redeemed!")
+
+
 @app_commands.command(name="help", description="Show all Food and b4u bot commands")
 @app_commands.guild_only()
 async def help_cmd(interaction: discord.Interaction):
@@ -2401,7 +2769,13 @@ async def help_cmd(interaction: discord.Interaction):
         "`/setlogs` — set the transcript / log channel\n"
         "`/panel` — re-post the panel here\n"
         "`/blacklist` · `/unblacklist` — block / unblock a member from tickets\n"
-        "`/listadd` · `/listremove` — edit the restaurant list"), inline=False)
+        "`/listadd` · `/listremove` — edit the restaurant list\n"
+        "`/set vouch` — vouch channel • `/buyer` — buyer role • `/givestars` — add/remove stars"), inline=False)
+    embed.add_field(name="⭐ Vouches & Rewards (everyone)", value=(
+        "After a completed order the customer gets the **buyer role** and a **Leave a Vouch** button "
+        "(stars + screenshot → posted in the vouch channel). Each vouch = **+1 ⭐**.\n"
+        f"`/stars` — check your stars • `/free order` — use **{FREE_ORDER_STARS} ⭐** in your ticket for a FREE order"),
+        inline=False)
     embed.add_field(name="🍽️ Menu", value=(
         "`/list` — post the restaurant list with **Create Order** + **Price Calculator** buttons\n"
         f"The panel also has **📋 Restaurants** and **🧮 Price Calculator** buttons (you pay {PRICE_RULE})."),
@@ -2418,7 +2792,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/close` — close & delete the ticket (transcript saved)\n"
         "`/orderinfo` — every detail of this order\n"
         "`/queue` — every order waiting / in progress\n"
-        "`/set` — save your payment info (e.g. Venmo → 973 202 0355) • `/mypay` · `/unset`\n"
+        "`/set payment` — save your payment info (e.g. Venmo → 973 202 0355) • `/mypay` · `/unset`\n"
         "`/pay` or type `.venmo` `.cashapp` `.pay` … in a ticket — send YOUR saved payment info\n"
         "`/add` · `/remove` · `/rename` — manage the ticket"), inline=False)
     embed.add_field(name="🔘 Chef buttons (after claiming)", value=(
@@ -2432,12 +2806,17 @@ async def help_cmd(interaction: discord.Interaction):
 ALL_COMMANDS = [ticket_cmd, setchef_cmd, setlogs_cmd, panel_cmd, clockin_cmd, clockout_cmd, staffonline_cmd,
                 stats_cmd, leaderboard_cmd, claim_cmd, unclaim_cmd, complete_cmd, close_cmd, add_cmd,
                 remove_cmd, rename_cmd, orderinfo_cmd, blacklist_cmd, unblacklist_cmd, list_cmd, listadd_cmd,
-                listremove_cmd, queue_cmd, set_cmd, unset_cmd, mypay_cmd, pay_cmd, help_cmd]
+                listremove_cmd, queue_cmd, set_group, unset_cmd, mypay_cmd, pay_cmd, buyer_cmd, stars_cmd,
+                givestars_cmd, free_group, help_cmd]
 
 
 # ==========================================================================
 # Client
 # ==========================================================================
+PERSISTENT_VIEWS = (PanelView, ListView, CloseConfirmView, TicketControlView, AddressStepView, ShotStepView, PayStepView,
+                    AddressConfirmView, ClaimView, ClaimedView, RateView, VouchView)
+
+
 class FoodBot(discord.Client):
     def __init__(self, message_content: bool):
         intents = discord.Intents.default()
