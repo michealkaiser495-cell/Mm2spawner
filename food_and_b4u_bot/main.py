@@ -1743,6 +1743,10 @@ def pay_info_embed(chef: discord.Member, methods: list, ticket: Optional[dict]) 
     if ticket:
         embed.add_field(name="🆔 Order", value=f"#{ticket['number']:04d}", inline=True)
     embed.add_field(name="🧑‍🍳 Chef", value=chef.mention, inline=True)
+    below = "the address message right below this" if len(methods) == 1 else "the address messages right below this"
+    embed.add_field(name="📱 Copy on your phone",
+                    value=f"**Hold your finger** on {below} → tap **Copy Text**. It copies only the address.",
+                    inline=False)
     embed.add_field(name="📸 After you pay",
                     value="Send a **screenshot of the payment** here so your chef can confirm it.", inline=False)
     embed.set_thumbnail(url=chef.display_avatar.url)
@@ -1762,6 +1766,10 @@ async def post_pay_info(channel, chef: discord.Member, wanted: Optional[str] = N
     await channel.send(content=mention(ticket["owner_id"]) if ticket else None,
                        embed=pay_info_embed(chef, methods, ticket),
                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    # Each address as its own plain message (nothing else in it): on mobile, hold it -> Copy Text copies exactly
+    # the address. Text inside embeds can't be copied on mobile.
+    for _method, address in methods:
+        await channel.send(content=address, allowed_mentions=discord.AllowedMentions.none())
     return None
 
 
