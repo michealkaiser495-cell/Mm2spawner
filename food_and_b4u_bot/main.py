@@ -1,5 +1,5 @@
 """
-Food and b4u Order Desk v10 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v11 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -141,6 +141,7 @@ class Store:
         "blacklist": {},         # {user_id: reason}
         "payinfo": {},           # {user_id: {method: address}}  saved with /set payment
         "buyer_role": None,      # given to customers when their order is completed (/buyer)
+        "chef_logs": {},         # {chef_user_id: channel_id}  private per-chef log channel (/cheflog)
         "ai_enabled": False,     # owner turned on AI help for customers in support tickets (/aisupport)
         "ai_model": AI_MODEL_DEFAULT,  # set below if a retired default is stored
         "ai_calls": 0,           # how many AI answers the bot has given (for the owner's info)
@@ -3119,6 +3120,51 @@ async def buyer_cmd(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
 
 
+@app_commands.command(name="cheflog", description="Make a private log channel only this chef can see")
+@app_commands.describe(member="The chef to make a private log channel for")
+@app_commands.guild_only()
+@owner_only()
+async def cheflog_cmd(interaction: discord.Interaction, member: discord.Member):
+    guild = interaction.guild
+    g = store.guild(guild.id)
+    existing_id = g["chef_logs"].get(str(member.id))
+    if existing_id and guild.get_channel(existing_id):
+        return await send_error(interaction, f"{member.mention} already has a log channel: <#{existing_id}>")
+
+    category = guild.get_channel(g["category"]) if g["category"] else None
+    category = category if isinstance(category, discord.CategoryChannel) else None
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: member_overwrite(),           # only this chef can see & type
+        guild.me: member_overwrite(),
+    }
+    try:
+        channel = await guild.create_text_channel(
+            name=f"cheflog-{slugify(member.name)}", category=category, overwrites=overwrites,
+            topic=f"Private log for {member} ({member.id}) — only they and admins can see this.",
+            reason=f"{BRAND} chef log for {member}")
+    except discord.Forbidden:
+        return await send_error(interaction, "I can't create channels. Give my role **Administrator** "
+                                             "(or Manage Channels + Manage Roles).")
+    except discord.HTTPException as exc:
+        return await send_error(interaction, f"Discord error creating the channel: {exc}")
+
+    g["chef_logs"][str(member.id)] = channel.id
+    store.save()
+
+    welcome = discord.Embed(
+        title="🧑‍🍳 Your Private Chef Log",
+        description=(f"Welcome {member.mention}! This channel is **just for you** — only you and the admins "
+                     "can see it.\n\nUse it for your own order notes, hand-offs, and the 🤖 **AI Assist** / `/ai` helper."),
+        color=COLOR_BLUE,
+    )
+    await channel.send(content=member.mention, embed=stamp(welcome),
+                       allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    done = discord.Embed(title="✅ Chef Log Created",
+                         description=f"Private log channel for {member.mention}: {channel.mention}", color=COLOR_GREEN)
+    await interaction.response.send_message(embed=stamp(done), ephemeral=True)
+
+
 @app_commands.command(name="stars", description="See how many vouch stars you have")
 @app_commands.describe(member="Check someone else (chefs/owner only)")
 @app_commands.guild_only()
@@ -3349,6 +3395,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/blacklist` · `/unblacklist` — block / unblock a member from tickets\n"
         "`/listadd` · `/listremove` — edit the restaurant list\n"
         "`/set vouch` — vouch channel • `/buyer` — buyer role • `/givestars` — add/remove stars\n"
+        "`/cheflog @chef` — give a chef a private log channel only they can see\n"
         "`/aisupport on|off` — AI help for customers in support tickets"), inline=False)
     embed.add_field(name="⭐ Vouches & Rewards (everyone)", value=(
         "After a completed order the customer gets the **buyer role** and a **Leave a Vouch** button "
@@ -3389,7 +3436,7 @@ ALL_COMMANDS = [ticket_cmd, setchef_cmd, setlogs_cmd, panel_cmd, clockin_cmd, cl
                 stats_cmd, leaderboard_cmd, claim_cmd, unclaim_cmd, complete_cmd, close_cmd, add_cmd,
                 remove_cmd, rename_cmd, orderinfo_cmd, blacklist_cmd, unblacklist_cmd, list_cmd, listadd_cmd,
                 listremove_cmd, queue_cmd, set_group, unset_cmd, mypay_cmd, pay_cmd, buyer_cmd, stars_cmd,
-                givestars_cmd, free_group, notify_cmd, aisupport_cmd, ai_cmd, help_cmd]
+                givestars_cmd, free_group, notify_cmd, aisupport_cmd, ai_cmd, cheflog_cmd, help_cmd]
 
 
 # ==========================================================================
@@ -3460,6 +3507,12 @@ class FoodBot(discord.Client):
     async def on_guild_channel_delete(self, channel):
         store.delete_ticket(channel.id)
         channel_locks.pop(channel.id, None)
+        g = store.guild(channel.guild.id)
+        gone = [uid for uid, cid in g["chef_logs"].items() if cid == channel.id]
+        for uid in gone:
+            g["chef_logs"].pop(uid, None)
+        if gone:
+            store.save()
 
     async def on_error(self, event_method: str, *args, **kwargs) -> None:
         log.exception("Error in %s - the bot keeps running", event_method)
