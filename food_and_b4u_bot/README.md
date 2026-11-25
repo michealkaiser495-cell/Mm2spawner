@@ -1,4 +1,4 @@
-# Food and b4u Order Desk bot (v7)
+# Food and b4u Order Desk bot (v8)
 
 1. `pip install -U -r requirements.txt`  (needs discord.py 2.7+)
 2. Put your token in `TOKEN` at the top of `main.py` (or set `DISCORD_TOKEN`).
@@ -10,9 +10,9 @@ Without it, customers use the pop-up forms (buttons) and everything still works.
 
 Slash commands are restricted to the server owner/admins and the chef role.
 Owner only: /ticket /setchef /setlogs /panel /blacklist /unblacklist /listadd /listremove
-            /set vouch /buyer /givestars
+            /set vouch /buyer /givestars /aisupport
 Owner + chef: /clockin /clockout /staffonline /stats /leaderboard /claim /unclaim /complete /close
-              /orderinfo /queue /list /notify /add /remove /rename /help
+              /orderinfo /queue /list /notify /ai /add /remove /rename /help
               /set payment /unset /mypay /pay  (+ type .venmo .cashapp .pay ... in a ticket)
 
 Chef buttons after claiming: Payment Received -> Order Placed -> On The Way -> Mark Complete.
@@ -27,3 +27,9 @@ vouch channel, +1 star each). Everyone: /stars, /free order (10 stars = free ord
 
 Claimed orders show a copyable delivery address and a Full Address button (exact street/city/state/ZIP via
 the free US Census geocoder, OpenStreetMap as fallback). /notify DMs the customer a link to their ticket.
+
+AI support (Claude, optional): set the ANTHROPIC_API_KEY environment variable and restart, then the owner runs
+/aisupport on. Customers get an "Ask AI" button in support tickets; chefs get an "AI Assist" button on claimed
+orders and the /ai command. Model defaults to claude-sonnet-5-5 (change with /aisupport ... model:). Replies are
+short and low-effort to keep API cost down. Without the key, everything else works unchanged.
+  pip install -U -r requirements.txt   (now also installs the anthropic SDK)

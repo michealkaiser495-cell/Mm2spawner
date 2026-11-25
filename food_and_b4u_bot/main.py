@@ -1,5 +1,5 @@
 """
-Food and b4u Order Desk v7 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v8 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+import anthropic
 import discord
 from discord import app_commands
 
@@ -53,6 +54,14 @@ MAX_ORDER_TOTAL = Decimal("100000")
 CLOSE_DELAY_SECONDS = 5
 FREE_ORDER_STARS = 10                   # vouch stars needed for /free order
 NOTIFY_COOLDOWN_SECONDS = 30
+# ---- AI support (Claude) --------------------------------------------------
+AI_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()  # set this env var to turn AI on
+AI_MODEL_DEFAULT = "claude-sonnet-5-5"                    # owner can change with /aisupport
+AI_MAX_TOKENS = 600                                       # keep replies short = cheap
+AI_EFFORT = "low"                                         # low thinking = fewer tokens = cheaper
+AI_MAX_INPUT = 800                                        # trim the customer's question
+AI_COOLDOWN_SECONDS = 6                                   # per-user, stops spam / runaway cost
+AI_MAX_PER_TICKET = 15                                    # hard cap of AI replies per ticket
 GEO_USER_AGENT = "FoodAndB4uBot/1.0 (Discord order bot)"
 CENSUS_URL = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
@@ -124,6 +133,9 @@ class Store:
         "blacklist": {},         # {user_id: reason}
         "payinfo": {},           # {user_id: {method: address}}  saved with /set payment
         "buyer_role": None,      # given to customers when their order is completed (/buyer)
+        "ai_enabled": False,     # owner turned on AI help for customers in support tickets (/aisupport)
+        "ai_model": AI_MODEL_DEFAULT,
+        "ai_calls": 0,           # how many AI answers the bot has given (for the owner's info)
         "vouch_channel": None,   # where vouches are posted (/set vouch)
         "vouch_counter": 0,
         "restaurants": DEFAULT_RESTAURANTS,   # 3 columns shown by /list
@@ -1015,7 +1027,7 @@ class ClaimedView(SafeView):
         super().__init__(timeout=None)
         t = ticket or {}
         if t.get("kind") == "support":
-            for item in (self.paid, self.placed, self.onway, self.fulladdr):
+            for item in (self.paid, self.placed, self.onway, self.fulladdr, self.payinfo):
                 self.remove_item(item)
         if disabled:
             for item in self.children:
@@ -1047,6 +1059,13 @@ class ClaimedView(SafeView):
                        custom_id="fb4u:order:fulladdr", row=1)
     async def fulladdr(self, interaction: discord.Interaction, button: discord.ui.Button):
         await do_fulladdress(interaction)
+
+    @discord.ui.button(label="AI Assist", emoji="🤖", style=discord.ButtonStyle.secondary,
+                       custom_id="fb4u:order:aiassist", row=2)
+    async def aiassist(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not ai_ready():
+            return await send_error(interaction, "AI isn't set up. The owner must set the `ANTHROPIC_API_KEY` env var.")
+        await interaction.response.send_modal(ChefAIModal())
 
     @discord.ui.button(label="Payment Info", emoji="💸", style=discord.ButtonStyle.success,
                        custom_id="fb4u:order:payinfo", row=1)
@@ -1207,6 +1226,8 @@ async def open_ticket(interaction: discord.Interaction, kind: str) -> None:
                        allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
     if kind != "support":
         await send_step(channel, ticket, step_address_embed(), AddressStepView())
+    elif store.guild(guild.id).get("ai_enabled") and ai_ready():
+        await channel.send(embed=ai_support_embed(store.guild(guild.id)), view=AISupportView())
 
     done = discord.Embed(title="✅ Ticket Created",
                          description=f"Your ticket is ready: {channel.mention}\nHead over there to continue.",
@@ -2167,6 +2188,228 @@ async def do_fulladdress(interaction: discord.Interaction) -> None:
     await interaction.followup.send(content=content[:2000], embed=full_address_embed(ticket, geo), ephemeral=True)
 
 
+# ==========================================================================
+# AI support, powered by Claude (optional — needs the ANTHROPIC_API_KEY env var)
+# ==========================================================================
+_ai_client: Optional[anthropic.AsyncAnthropic] = None
+ai_cooldowns: dict[int, float] = {}
+
+CUSTOMER_SYSTEM = (
+    "You are the friendly support assistant for \"{brand}\", a Discord food-ordering service. "
+    "How it works: customers open a ticket, tell us the restaurant and their delivery address, send a "
+    "screenshot of their cart with the order total, and pay only a fraction of that total ({price_rule}); "
+    "then a chef claims the order and gets it delivered. Customers earn a star for leaving a vouch after each "
+    "order, and {free_stars} stars = a free order.\n\n"
+    "Answer the customer's question in a warm, short, helpful way (1-4 sentences, light emoji is fine). "
+    "Only answer questions about using this service and ordering food. For anything about a specific payment, "
+    "refund, a problem with their order, or anything you are unsure of, tell them a staff member will help them "
+    "shortly and to wait in the ticket. Never ask for passwords, card numbers, or login details, and never make "
+    "up prices, times, or order details you were not given. Do not help with anything illegal."
+)
+CHEF_SYSTEM = (
+    "You are an assistant helping a staff member (\"chef\") handle a customer's food-delivery order ticket for "
+    "\"{brand}\". Be concise and practical. You can summarize the order, draft a short polite message to the "
+    "customer, or suggest the next step. Use only the order details provided. Do not invent prices or addresses, "
+    "and do not help with anything illegal."
+)
+
+
+def ai_ready() -> bool:
+    return bool(AI_API_KEY)
+
+
+def get_ai_client() -> Optional[anthropic.AsyncAnthropic]:
+    global _ai_client
+    if not AI_API_KEY:
+        return None
+    if _ai_client is None:
+        _ai_client = anthropic.AsyncAnthropic(api_key=AI_API_KEY)
+    return _ai_client
+
+
+async def ai_ask(guild_id: int, system: str, question: str) -> tuple[bool, str]:
+    """Ask Claude. Returns (ok, text). Never raises — turns every error into a friendly message."""
+    client = get_ai_client()
+    if client is None:
+        return False, ("🤖 AI help isn't switched on. The owner needs to set the `ANTHROPIC_API_KEY` "
+                       "environment variable (and `/aisupport on`).")
+    g = store.guild(guild_id)
+    model = g.get("ai_model") or AI_MODEL_DEFAULT
+    try:
+        resp = await client.messages.create(
+            model=model,
+            max_tokens=AI_MAX_TOKENS,
+            system=system,
+            messages=[{"role": "user", "content": question[:AI_MAX_INPUT]}],
+            output_config={"effort": AI_EFFORT},
+        )
+    except anthropic.AuthenticationError:
+        return False, "🤖 The AI key was rejected. The owner should check `ANTHROPIC_API_KEY`."
+    except anthropic.RateLimitError:
+        return False, "🤖 The AI is busy right now — try again in a moment."
+    except anthropic.APIError as exc:
+        log.warning("AI call failed: %s", exc)
+        return False, "🤖 The AI couldn't answer right now. A staff member will help you."
+    except Exception as exc:  # never let the AI crash the bot
+        log.warning("AI unexpected error: %s", exc)
+        return False, "🤖 The AI couldn't answer right now. A staff member will help you."
+    if resp.stop_reason == "refusal":
+        return False, "🤖 I can't help with that one — a staff member will take it from here."
+    text = "".join(getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text").strip()
+    if not text:
+        return False, "🤖 I didn't catch that — could you rephrase, or wait for a staff member?"
+    g["ai_calls"] = g.get("ai_calls", 0) + 1
+    store.save()
+    return True, text[:3900]
+
+
+def ai_cooldown_left(user_id: int) -> float:
+    return ai_cooldowns.get(user_id, 0) + AI_COOLDOWN_SECONDS - time.monotonic()
+
+
+def order_context(t: dict) -> str:
+    g = store.guild(t["guild_id"])
+    lines = [f"Order #{t['number']:04d} ({t['kind']})", f"Status: {order_status(t) if t['kind'] != 'support' else 'support ticket'}"]
+    if t.get("restaurant"):
+        lines.append(f"Restaurant: {t['restaurant']}")
+    # city only, not the full street address, to keep personal info out of the API call
+    addr = delivery_address(t)
+    if addr:
+        parts = [x.strip() for x in addr.replace("\n", ",").split(",") if x.strip()]
+        if len(parts) >= 2:
+            lines.append(f"Delivery area: {parts[-2]}")
+    if t.get("total"):
+        lines.append(f"Order total: {money(Decimal(t['total']))}")
+    if t.get("due"):
+        lines.append(f"Customer pays: {money(Decimal(t['due']))}")
+    if t.get("payment"):
+        lines.append(f"Payment method: {t['payment']}")
+    if t.get("free"):
+        lines.append("This is a FREE reward order.")
+    return "\n".join(lines)
+
+
+async def run_customer_ai(interaction: discord.Interaction, question: str) -> None:
+    channel = interaction.channel
+    ticket = store.ticket(channel.id) if channel else None
+    if ticket is None:
+        return await send_error(interaction, "This only works inside a ticket.")
+    g = store.guild(channel.guild.id)
+    if not g.get("ai_enabled"):
+        return await send_error(interaction, "AI help isn't turned on here. A staff member will help you shortly.")
+    if ticket.get("ai_used", 0) >= AI_MAX_PER_TICKET:
+        return await send_error(interaction, "The AI has helped a lot in this ticket already — a staff member will take over now.")
+    left = ai_cooldown_left(interaction.user.id)
+    if left > 0:
+        return await send_error(interaction, f"One sec — try again in {left:.0f}s.")
+    ai_cooldowns[interaction.user.id] = time.monotonic()
+    await ack(interaction)
+
+    system = CUSTOMER_SYSTEM.format(brand=BRAND, price_rule=PRICE_RULE, free_stars=FREE_ORDER_STARS)
+    ok, answer = await ai_ask(channel.guild.id, system, question)
+    ticket = store.ticket(channel.id)
+    if ticket is not None:
+        ticket["ai_used"] = ticket.get("ai_used", 0) + 1
+        store.set_ticket(channel.id, ticket)
+    embed = discord.Embed(title="🤖 AI Support", color=COLOR_BLURPLE if ok else COLOR_ORANGE,
+                          description=answer)
+    embed.add_field(name="❓ You asked", value=f">>> {question[:300]}", inline=False)
+    embed.add_field(name="🙋 Need a person?", value="Press **Talk to a human** below and a staff member will come help.",
+                    inline=False)
+    embed.set_footer(text=f"{BRAND} • AI assistant — a staff member can always help too")
+    await interaction.followup.send(embed=embed, view=AISupportView())
+
+
+async def run_chef_ai(interaction: discord.Interaction, question: str) -> None:
+    channel = interaction.channel
+    ticket = store.ticket(channel.id) if channel else None
+    if ticket is None:
+        return await send_error(interaction, "Use this inside a ticket.")
+    if not is_staff(interaction.user, store.guild(channel.guild.id)):
+        return await send_error(interaction, "Only chefs or the owner can use AI assist.")
+    if not ai_ready():
+        return await send_error(interaction, "AI isn't set up. The owner must set the `ANTHROPIC_API_KEY` env var.")
+    left = ai_cooldown_left(interaction.user.id)
+    if left > 0:
+        return await send_error(interaction, f"One sec — try again in {left:.0f}s.")
+    ai_cooldowns[interaction.user.id] = time.monotonic()
+    await ack(interaction)
+    prompt = f"Order details:\n{order_context(ticket)}\n\nChef's request: {question}"
+    ok, answer = await ai_ask(channel.guild.id, CHEF_SYSTEM.format(brand=BRAND), prompt)
+    embed = discord.Embed(title="🤖 AI Assist (chefs only)", color=COLOR_BLUE if ok else COLOR_ORANGE,
+                          description=answer)
+    embed.add_field(name="🧑‍🍳 You asked", value=f">>> {question[:300]}", inline=False)
+    embed.set_footer(text=f"{BRAND} • Only you can see this — double-check before sending to the customer")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class CustomerAIModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="🤖 Ask AI Support", timeout=600)
+        self.q = discord.ui.TextInput(style=discord.TextStyle.paragraph, max_length=AI_MAX_INPUT,
+                                      placeholder="e.g. How much will I pay for a $40 order? How long does delivery take?")
+        self.add_item(discord.ui.Label(text="Your question", description="Ask anything about ordering with us",
+                                       component=self.q))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await run_customer_ai(interaction, self.q.value.strip())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("CustomerAIModal failed", exc_info=error)
+        await send_error(interaction, "Couldn't reach the AI. A staff member will help you shortly.")
+
+
+class ChefAIModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="🤖 AI Assist", timeout=600)
+        self.q = discord.ui.TextInput(style=discord.TextStyle.paragraph, max_length=AI_MAX_INPUT,
+                                      placeholder="e.g. Summarize this order • Draft a polite update for the customer")
+        self.add_item(discord.ui.Label(text="What do you need?", description="Summary, a drafted reply, next step…",
+                                       component=self.q))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await run_chef_ai(interaction, self.q.value.strip())
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("ChefAIModal failed", exc_info=error)
+        await send_error(interaction, "Couldn't reach the AI. Try again in a moment.")
+
+
+class AISupportView(SafeView):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Ask AI", emoji="🤖", style=discord.ButtonStyle.primary, custom_id="fb4u:ai:ask")
+    async def ask(self, interaction: discord.Interaction, button: discord.ui.Button):
+        g = store.guild(interaction.guild.id)
+        if not g.get("ai_enabled"):
+            return await send_error(interaction, "AI help isn't turned on here — a staff member will help you shortly.")
+        await interaction.response.send_modal(CustomerAIModal())
+
+    @discord.ui.button(label="Talk to a human", emoji="🙋", style=discord.ButtonStyle.secondary,
+                       custom_id="fb4u:ai:human")
+    async def human(self, interaction: discord.Interaction, button: discord.ui.Button):
+        g = store.guild(interaction.guild.id)
+        ping = role_mention(g["chef_role"] or g["staff_role"])
+        await interaction.response.send_message(
+            content=ping if (g["chef_role"] or g["staff_role"]) else None,
+            embed=note(f"🙋 {interaction.user.mention} would like a human to help — a staff member will be with you soon!",
+                       COLOR_GOLD),
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
+
+
+def ai_support_embed(g: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="🤖 AI Support is here to help",
+        description=("While you wait for a staff member, press **Ask AI** to get instant answers about ordering, "
+                     "prices, delivery and rewards.\nPrefer a person? Press **Talk to a human** any time."),
+        color=COLOR_BLURPLE,
+    )
+    embed.add_field(name="💡 Try asking", value="• How much do I pay for a $45 order?\n• How do I earn a free order?\n"
+                                               "• How long does delivery take?", inline=False)
+    return stamp(embed)
+
+
 def check_can_close(member: discord.Member, ticket: dict) -> None:
     g = store.guild(ticket["guild_id"])
     if member.id != ticket["owner_id"] and not is_staff(member, g):
@@ -2937,6 +3180,42 @@ def link_view(url: str, label: str, emoji: str) -> discord.ui.View:
     return view
 
 
+@app_commands.command(name="aisupport", description="Turn AI support for customers on or off")
+@app_commands.describe(switch="on or off", model="Which Claude model to use (optional)")
+@app_commands.choices(switch=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
+@app_commands.guild_only()
+@owner_only()
+async def aisupport_cmd(interaction: discord.Interaction, switch: app_commands.Choice[str],
+                        model: Optional[str] = None):
+    g = store.guild(interaction.guild.id)
+    g["ai_enabled"] = switch.value == "on"
+    if model:
+        g["ai_model"] = model.strip()
+    store.save()
+    on = g["ai_enabled"]
+    embed = discord.Embed(title="🤖 AI Support " + ("Enabled" if on else "Disabled"),
+                          color=COLOR_GREEN if on else COLOR_DARK,
+                          description=("Customers now get an **Ask AI** helper in support tickets. 🎉" if on else
+                                       "AI support for customers is now off. Chefs can still use **AI Assist** / `/ai`."))
+    embed.add_field(name="🔑 API key", value="✅ Set" if ai_ready() else
+                    "❌ **Missing** — set the `ANTHROPIC_API_KEY` env var, then restart the bot", inline=True)
+    embed.add_field(name="🧠 Model", value=f"`{g['ai_model']}`", inline=True)
+    embed.add_field(name="📊 AI answers given", value=str(g.get("ai_calls", 0)), inline=True)
+    if on and not ai_ready():
+        embed.add_field(name="⚠️ Heads up", value="AI is enabled but there's no API key yet, so it can't answer. "
+                        "Set `ANTHROPIC_API_KEY` and restart.", inline=False)
+    embed.add_field(name="💡 Chef tool", value="Chefs can always use **🤖 AI Assist** on a claimed order or `/ai <question>`.",
+                    inline=False)
+    await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
+
+
+@app_commands.command(name="ai", description="Ask the AI for help handling this ticket (chefs only)")
+@app_commands.describe(question="What you need: a summary, a drafted reply, the next step…")
+@app_commands.guild_only()
+async def ai_cmd(interaction: discord.Interaction, question: app_commands.Range[str, 1, AI_MAX_INPUT]):
+    await run_chef_ai(interaction, question.strip())
+
+
 @app_commands.command(name="notify", description="DM the customer in this ticket that the owner needs them")
 @app_commands.describe(message="Extra message to include in the DM (optional)")
 @app_commands.guild_only()
@@ -3006,7 +3285,8 @@ async def help_cmd(interaction: discord.Interaction):
         "`/panel` — re-post the panel here\n"
         "`/blacklist` · `/unblacklist` — block / unblock a member from tickets\n"
         "`/listadd` · `/listremove` — edit the restaurant list\n"
-        "`/set vouch` — vouch channel • `/buyer` — buyer role • `/givestars` — add/remove stars"), inline=False)
+        "`/set vouch` — vouch channel • `/buyer` — buyer role • `/givestars` — add/remove stars\n"
+        "`/aisupport on|off` — AI help for customers in support tickets"), inline=False)
     embed.add_field(name="⭐ Vouches & Rewards (everyone)", value=(
         "After a completed order the customer gets the **buyer role** and a **Leave a Vouch** button "
         "(stars + screenshot → posted in the vouch channel). Each vouch = **+1 ⭐**.\n"
@@ -3028,6 +3308,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/close` — close & delete the ticket (transcript saved)\n"
         "`/orderinfo` — every detail of this order\n"
         "`/notify` — DM the customer that you need them (with a link to the ticket)\n"
+        "`/ai <question>` — AI assist for handling this ticket (chefs)\n"
         "`/queue` — every order waiting / in progress\n"
         "`/set payment` — save your payment info (e.g. Venmo → 973 202 0355) • `/mypay` · `/unset`\n"
         "`/pay` or type `.venmo` `.cashapp` `.pay` … in a ticket — send YOUR saved payment info\n"
@@ -3045,14 +3326,14 @@ ALL_COMMANDS = [ticket_cmd, setchef_cmd, setlogs_cmd, panel_cmd, clockin_cmd, cl
                 stats_cmd, leaderboard_cmd, claim_cmd, unclaim_cmd, complete_cmd, close_cmd, add_cmd,
                 remove_cmd, rename_cmd, orderinfo_cmd, blacklist_cmd, unblacklist_cmd, list_cmd, listadd_cmd,
                 listremove_cmd, queue_cmd, set_group, unset_cmd, mypay_cmd, pay_cmd, buyer_cmd, stars_cmd,
-                givestars_cmd, free_group, notify_cmd, help_cmd]
+                givestars_cmd, free_group, notify_cmd, aisupport_cmd, ai_cmd, help_cmd]
 
 
 # ==========================================================================
 # Client
 # ==========================================================================
 PERSISTENT_VIEWS = (PanelView, ListView, CloseConfirmView, TicketControlView, AddressStepView, ShotStepView, PayStepView,
-                    AddressConfirmView, ClaimView, ClaimedView, RateView, VouchView)
+                    AddressConfirmView, ClaimView, ClaimedView, RateView, VouchView, AISupportView)
 
 
 class FoodBot(discord.Client):
@@ -3085,6 +3366,8 @@ class FoodBot(discord.Client):
                                          scopes=("bot", "applications.commands"))
         log.info("Logged in as %s (%s) - in %d server(s)", self.user, self.user.id, len(self.guilds))
         log.info("Typed answers: %s", "ON" if TYPED_INPUT else "OFF (forms only - enable Message Content Intent to allow typing)")
+        log.info("AI support: %s", f"key set, model default {AI_MODEL_DEFAULT} (owner enables per-server with /aisupport)"
+                 if ai_ready() else "OFF (set ANTHROPIC_API_KEY env var to enable)")
         log.info("Invite link: %s", invite)
         if not self.guilds:
             log.warning("The bot is NOT in any server yet. Open the invite link above to add it.")
