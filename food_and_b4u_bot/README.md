@@ -1,4 +1,4 @@
-# Food and b4u Order Desk bot (v6)
+# Food and b4u Order Desk bot (v7)
 
 1. `pip install -U -r requirements.txt`  (needs discord.py 2.7+)
 2. Put your token in `TOKEN` at the top of `main.py` (or set `DISCORD_TOKEN`).
@@ -12,7 +12,7 @@ Slash commands are restricted to the server owner/admins and the chef role.
 Owner only: /ticket /setchef /setlogs /panel /blacklist /unblacklist /listadd /listremove
             /set vouch /buyer /givestars
 Owner + chef: /clockin /clockout /staffonline /stats /leaderboard /claim /unclaim /complete /close
-              /orderinfo /queue /list /add /remove /rename /help
+              /orderinfo /queue /list /notify /add /remove /rename /help
               /set payment /unset /mypay /pay  (+ type .venmo .cashapp .pay ... in a ticket)
 
 Chef buttons after claiming: Payment Received -> Order Placed -> On The Way -> Mark Complete.
@@ -24,3 +24,6 @@ The bot restarts itself if it crashes, refuses to run twice, and writes foodb4u.
 
 Vouches: after completion the customer gets the buyer role and a Leave a Vouch button (stars + screenshot ->
 vouch channel, +1 star each). Everyone: /stars, /free order (10 stars = free order, pings owners).
+
+Claimed orders show a copyable delivery address and a Full Address button (exact street/city/state/ZIP via
+the free US Census geocoder, OpenStreetMap as fallback). /notify DMs the customer a link to their ticket.

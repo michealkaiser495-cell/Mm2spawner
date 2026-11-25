@@ -1,5 +1,5 @@
 """
-Food and b4u Order Desk v6 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v7 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -30,12 +30,14 @@ import time
 import traceback
 import types
 import urllib.error
+import urllib.parse
 import urllib.request
 from logging.handlers import RotatingFileHandler
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import discord
 from discord import app_commands
 
@@ -50,6 +52,10 @@ PRICE_DIVISOR = Decimal(3)              # customer pays 1/3 of the order total
 MAX_ORDER_TOTAL = Decimal("100000")
 CLOSE_DELAY_SECONDS = 5
 FREE_ORDER_STARS = 10                   # vouch stars needed for /free order
+NOTIFY_COOLDOWN_SECONDS = 30
+GEO_USER_AGENT = "FoodAndB4uBot/1.0 (Discord order bot)"
+CENSUS_URL = "https://geocoding.geo.census.gov/geocoder/locations/onelineaddress"
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 TICKET_COOLDOWN_SECONDS = 10
 DATA_FILE = Path(__file__).with_name("foodandb4u_data.json")
 LOG_FILE = Path(__file__).with_name("foodb4u.log")
@@ -1009,7 +1015,7 @@ class ClaimedView(SafeView):
         super().__init__(timeout=None)
         t = ticket or {}
         if t.get("kind") == "support":
-            for item in (self.paid, self.placed, self.onway):
+            for item in (self.paid, self.placed, self.onway, self.fulladdr):
                 self.remove_item(item)
         if disabled:
             for item in self.children:
@@ -1036,6 +1042,11 @@ class ClaimedView(SafeView):
                        custom_id="fb4u:order:onway", row=0)
     async def onway(self, interaction: discord.Interaction, button: discord.ui.Button):
         await do_progress(interaction, "onway")
+
+    @discord.ui.button(label="Full Address", emoji="📍", style=discord.ButtonStyle.primary,
+                       custom_id="fb4u:order:fulladdr", row=1)
+    async def fulladdr(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await do_fulladdress(interaction)
 
     @discord.ui.button(label="Payment Info", emoji="💸", style=discord.ButtonStyle.success,
                        custom_id="fb4u:order:payinfo", row=1)
@@ -1500,8 +1511,13 @@ async def do_claim(interaction: discord.Interaction) -> None:
             embed.add_field(name="💵 Amount Due", value=money(Decimal(ticket["due"])), inline=True)
             embed.add_field(name="💳 Payment", value=payment_text(ticket), inline=True)
         embed.add_field(name="🕒 Claimed", value=ts(ticket["claimed_at"]), inline=True)
+        if delivery_address(ticket):
+            embed.add_field(name="🏠 Delivery Address", value=(
+                f"```\n{delivery_address(ticket)[:900]}\n```📱 Copy it from the message right below • "
+                "📍 **Full Address** finds the exact ZIP / city / state"), inline=False)
         embed.add_field(name="🛠️ Chef Controls", value=(
-            "**💸 Payment Info** — post YOUR saved payment address (from `/set`)\n"
+            "**📍 Full Address** — exact street, city, state & ZIP + map links\n"
+            "**💸 Payment Info** — post YOUR saved payment address (from `/set payment`)\n"
             "**💰 Payment Received** — confirm the customer paid\n"
             "**🛒 Order Placed** — you placed the order with the restaurant\n"
             "**🚗 On The Way** — the food is out for delivery\n"
@@ -1515,6 +1531,8 @@ async def do_claim(interaction: discord.Interaction) -> None:
                                  allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
         ticket["claim_msg_id"] = msg.id
         store.set_ticket(channel.id, ticket)
+        if delivery_address(ticket):   # plain message = hold -> Copy Text on mobile copies just the address
+            await channel.send(content=delivery_address(ticket)[:2000], allowed_mentions=discord.AllowedMentions.none())
         await finish(interaction, "✅ You claimed this order.")
 
 
@@ -1993,6 +2011,160 @@ async def submit_vouch(interaction: discord.Interaction, score: int, uploads: li
             thanks.add_field(name="📣 Posted", value="*No vouch channel set yet — the owner can use `/set vouch`.*",
                              inline=False)
         await channel.send(embed=stamp(thanks, f"Order #{ticket['number']:04d}"))
+
+
+# ==========================================================================
+# Full address lookup (US Census geocoder first, OpenStreetMap as fallback; both free, no key)
+# ==========================================================================
+UNIT_RE = re.compile(r"(?:,\s*|\s+)((?:apt|apartment|unit|suite|ste|rm|room|lot|#)\.?\s*#?\s*[\w-]+)\b", re.I)
+
+
+def delivery_address(t: dict) -> str:
+    """The address part only (typed answers may start with the restaurant on the first line)."""
+    text = (t.get("address") or "").strip()
+    if t.get("restaurant"):
+        return text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return "\n".join(lines[1:]) if len(lines) > 1 else text
+
+
+def split_unit(text: str) -> tuple[str, Optional[str]]:
+    m = UNIT_RE.search(text)
+    if not m:
+        return text, None
+    return (text[:m.start()] + text[m.end():]).strip(" ,"), m.group(1).upper()
+
+
+def _match_score(typed_upper: str, r: dict) -> int:
+    score = 0
+    if r.get("zip") and r["zip"] in typed_upper:
+        score += 4
+    if r.get("city") and r["city"].upper() in typed_upper:
+        score += 2
+    if r.get("state") and re.search(rf"\b{re.escape(r['state'].upper())}\b", typed_upper):
+        score += 1
+    return score
+
+
+async def _get_json(session: aiohttp.ClientSession, url: str, params: dict):
+    async with session.get(url, params=params, headers={"User-Agent": GEO_USER_AGENT}) as resp:
+        if resp.status != 200:
+            return None
+        return await resp.json(content_type=None)
+
+
+async def lookup_address(raw: str) -> dict:
+    """Find the exact street, city, state and ZIP for what the customer typed."""
+    one_line = " ".join(raw.replace("\n", ", ").split())
+    clean, unit = split_unit(one_line)
+    results, errors = [], 0
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+        try:
+            data = await _get_json(session, CENSUS_URL,
+                                   {"address": clean, "benchmark": "Public_AR_Current", "format": "json"})
+            for match in ((data or {}).get("result") or {}).get("addressMatches", [])[:5]:
+                comp = match.get("addressComponents", {})
+                results.append({
+                    "street": match["matchedAddress"].split(",")[0].strip(), "city": comp.get("city"),
+                    "state": comp.get("state"), "zip": comp.get("zip"), "county": None,
+                    "lat": match.get("coordinates", {}).get("y"), "lon": match.get("coordinates", {}).get("x"),
+                    "source": "US Census Bureau — exact match",
+                })
+        except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError, TypeError) as exc:
+            errors += 1
+            log.warning("Census lookup failed: %s", exc)
+        if not results:
+            try:
+                data = await _get_json(session, NOMINATIM_URL, {"q": clean, "format": "jsonv2", "addressdetails": 1,
+                                                                "countrycodes": "us", "limit": 5})
+                for item in data or []:
+                    a = item.get("address", {})
+                    state = (a.get("ISO3166-2-lvl4") or "").split("-")[-1] or a.get("state")
+                    street = " ".join(x for x in (a.get("house_number"), a.get("road")) if x)
+                    results.append({
+                        "street": (street or item.get("display_name", "").split(",")[0]).upper(),
+                        "city": (a.get("city") or a.get("town") or a.get("village") or a.get("hamlet")
+                                 or a.get("suburb") or "").upper() or None,
+                        "state": state.upper() if state else None, "zip": a.get("postcode"),
+                        "county": a.get("county"), "lat": item.get("lat"), "lon": item.get("lon"),
+                        "source": "OpenStreetMap — best guess, double-check it",
+                    })
+            except (aiohttp.ClientError, asyncio.TimeoutError, KeyError, ValueError, TypeError) as exc:
+                errors += 1
+                log.warning("OpenStreetMap lookup failed: %s", exc)
+    if not results:
+        return {"found": False, "typed": raw, "unit": unit, "service_down": errors >= 2}
+    typed_upper = one_line.upper()
+    for r in results:
+        r["score"] = _match_score(typed_upper, r)
+    results.sort(key=lambda r: -r["score"])           # stable: keeps the service's order on ties
+    for r in results:
+        street = f"{r['street']} {unit}" if unit else r["street"]
+        tail = " ".join(x for x in (r.get("state"), r.get("zip")) if x)
+        r["full"] = ", ".join(x for x in (street, r.get("city"), tail) if x)
+    best = results[0]
+    sure = len(results) == 1 or best["score"] > results[1]["score"]
+    return {"found": True, "best": best, "others": [] if sure else results[1:3], "count": len(results),
+            "sure": sure, "typed": raw, "unit": unit}
+
+
+def maps_links(text: str) -> str:
+    q = urllib.parse.quote_plus(text)
+    return (f"[Google Maps](https://www.google.com/maps/search/?api=1&query={q}) • "
+            f"[Apple Maps](https://maps.apple.com/?q={q})")
+
+
+def full_address_embed(t: dict, geo: dict) -> discord.Embed:
+    if not geo["found"]:
+        why = ("The address lookup services aren't answering right now — try again in a minute."
+               if geo.get("service_down") else
+               "I couldn't find an exact match. Ask the customer for the full street, city, state and ZIP.")
+        embed = discord.Embed(title="📍 Address Not Found", description=why, color=COLOR_ORANGE)
+        embed.add_field(name="✍️ Customer typed", value=f">>> {geo['typed']}"[:1024], inline=False)
+        embed.add_field(name="🗺️ Search it", value=maps_links(geo["typed"]), inline=False)
+        return stamp(embed, f"Order #{t['number']:04d}")
+    b = geo["best"]
+    embed = discord.Embed(title="📍 Full Address", color=COLOR_GREEN if geo["sure"] else COLOR_GOLD,
+                          description=f"```\n{b['full']}\n```")
+    embed.add_field(name="🏠 Street", value=b["street"] + (f" {geo['unit']}" if geo.get("unit") else ""), inline=True)
+    embed.add_field(name="🏙️ City", value=b.get("city") or "—", inline=True)
+    embed.add_field(name="🗺️ State", value=b.get("state") or "—", inline=True)
+    embed.add_field(name="📮 ZIP", value=f"**{b['zip']}**" if b.get("zip") else "—", inline=True)
+    if b.get("county"):
+        embed.add_field(name="🌎 County", value=b["county"], inline=True)
+    embed.add_field(name="🎯 Match", value=b["source"] + ("" if geo["sure"] else
+                    f"\n⚠️ **{geo['count']} possible addresses** — make sure it's the right one"), inline=False)
+    if geo["others"]:
+        embed.add_field(name="🔎 Other possible matches", value="\n".join(f"• {o['full']}" for o in geo["others"]),
+                        inline=False)
+    embed.add_field(name="✍️ Customer typed", value=f">>> {geo['typed']}"[:1024], inline=False)
+    if t.get("notes"):
+        embed.add_field(name="📝 Delivery notes", value=t["notes"][:1024], inline=False)
+    embed.add_field(name="🗺️ Open in maps", value=maps_links(b["full"]), inline=False)
+    embed.add_field(name="📱 Copy", value="Hold the address text above this embed → **Copy Text**.", inline=False)
+    return stamp(embed, f"Order #{t['number']:04d}")
+
+
+async def do_fulladdress(interaction: discord.Interaction) -> None:
+    channel = interaction.channel
+    ticket = store.ticket(channel.id) if channel else None
+    if ticket is None:
+        return await send_error(interaction, "This ticket no longer exists.")
+    if not is_staff(interaction.user, store.guild(channel.guild.id)):
+        return await send_error(interaction, "Only chefs or the owner can look up the address.")
+    address = delivery_address(ticket)
+    if not address:
+        return await send_error(interaction, "The customer hasn't entered an address yet.")
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    geo = ticket.get("geo") if ticket.get("geo_for") == address else None
+    if geo is None:
+        geo = await lookup_address(address)
+        fresh = store.ticket(channel.id)
+        if fresh is not None and not geo.get("service_down"):
+            fresh.update(geo=geo, geo_for=address)
+            store.set_ticket(channel.id, fresh)
+    content = geo["best"]["full"] if geo["found"] else address
+    await interaction.followup.send(content=content[:2000], embed=full_address_embed(ticket, geo), ephemeral=True)
 
 
 def check_can_close(member: discord.Member, ticket: dict) -> None:
@@ -2756,6 +2928,70 @@ async def free_order_cmd(interaction: discord.Interaction):
     await finish(interaction, "🎉 Free order redeemed!")
 
 
+notify_cooldowns: dict[int, float] = {}
+
+
+def link_view(url: str, label: str, emoji: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, url=url, label=label, emoji=emoji))
+    return view
+
+
+@app_commands.command(name="notify", description="DM the customer in this ticket that the owner needs them")
+@app_commands.describe(message="Extra message to include in the DM (optional)")
+@app_commands.guild_only()
+async def notify_cmd(interaction: discord.Interaction, message: Optional[app_commands.Range[str, 1, 300]] = None):
+    channel, actor = interaction.channel, interaction.user
+    ticket = store.ticket(channel.id) if channel else None
+    if ticket is None:
+        return await send_error(interaction, "Use `/notify` inside a ticket.")
+    wait = notify_cooldowns.get(channel.id, 0) + NOTIFY_COOLDOWN_SECONDS - time.monotonic()
+    if wait > 0:
+        return await send_error(interaction, f"The customer was just notified — try again in **{wait:.0f}s**.")
+    notify_cooldowns[channel.id] = time.monotonic()
+    await ack(interaction)
+
+    guild = interaction.guild
+    jump = channel.jump_url
+    who = "👑 **The owner**" if is_owner(actor) else f"🧑‍🍳 **{actor.display_name}** (chef)"
+    dm = discord.Embed(
+        title="🔔 You're needed in your ticket!", url=jump, color=COLOR_GOLD,
+        description=(f"{who} from **{guild.name}** needs you in your ticket.\n\n"
+                     f"👉 **[Click here to open your ticket]({jump})**"),
+    )
+    dm.add_field(name="🎫 Ticket", value=f"#{ticket['number']:04d} • {channel.mention}", inline=True)
+    dm.add_field(name="🏠 Server", value=guild.name, inline=True)
+    if ticket["kind"] != "support":
+        dm.add_field(name="📌 Order status", value=order_status(ticket), inline=False)
+    if message:
+        dm.add_field(name="💬 Message", value=f">>> {message}", inline=False)
+    if guild.icon:
+        dm.set_thumbnail(url=guild.icon.url)
+    stamp(dm, f"Order #{ticket['number']:04d}")
+
+    delivered = False
+    try:
+        customer = guild.get_member(ticket["owner_id"]) or await interaction.client.fetch_user(ticket["owner_id"])
+        await customer.send(embed=dm, view=link_view(jump, "Open Ticket", "🎫"))
+        delivered = True
+    except discord.HTTPException as exc:
+        log.info("Notify DM failed for %s: %s", ticket["owner_id"], exc)
+
+    note_embed = discord.Embed(
+        title="🔔 Customer Notified",
+        description=(f"{actor.mention} needs {mention(ticket['owner_id'])} here!\n\n"
+                     + ("📬 **DM sent** with a link to this ticket." if delivered else
+                        "⚠️ **Their DMs are closed** — pinged them here instead.")),
+        color=COLOR_GOLD if delivered else COLOR_ORANGE,
+    )
+    if message:
+        note_embed.add_field(name="💬 Message", value=f">>> {message}", inline=False)
+    await channel.send(content=mention(ticket["owner_id"]), embed=stamp(note_embed, f"Order #{ticket['number']:04d}"),
+                       allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    await finish(interaction, "📬 DM sent to the customer." if delivered else
+                 "⚠️ Their DMs are closed — I pinged them in the ticket instead.")
+
+
 @app_commands.command(name="help", description="Show all Food and b4u bot commands")
 @app_commands.guild_only()
 async def help_cmd(interaction: discord.Interaction):
@@ -2791,12 +3027,14 @@ async def help_cmd(interaction: discord.Interaction):
         "`/complete` — mark the order done\n"
         "`/close` — close & delete the ticket (transcript saved)\n"
         "`/orderinfo` — every detail of this order\n"
+        "`/notify` — DM the customer that you need them (with a link to the ticket)\n"
         "`/queue` — every order waiting / in progress\n"
         "`/set payment` — save your payment info (e.g. Venmo → 973 202 0355) • `/mypay` · `/unset`\n"
         "`/pay` or type `.venmo` `.cashapp` `.pay` … in a ticket — send YOUR saved payment info\n"
         "`/add` · `/remove` · `/rename` — manage the ticket"), inline=False)
     embed.add_field(name="🔘 Chef buttons (after claiming)", value=(
         "💰 **Payment Received** → 🛒 **Order Placed** → 🚗 **On The Way** → ✅ **Mark Complete**\n"
+        "📍 **Full Address** — exact street, city, state & ZIP (copyable) • 💸 **Payment Info** — your saved pay info\n"
         "Each one pings the customer and updates the order timeline. ↩️ **Unclaim** gives it back."), inline=False)
     embed.add_field(name="⭐ After completion", value="The customer rates the chef 1–5 stars (shown in `/stats` and "
                                                        "`/leaderboard`) and gets a receipt in DMs.", inline=False)
@@ -2807,7 +3045,7 @@ ALL_COMMANDS = [ticket_cmd, setchef_cmd, setlogs_cmd, panel_cmd, clockin_cmd, cl
                 stats_cmd, leaderboard_cmd, claim_cmd, unclaim_cmd, complete_cmd, close_cmd, add_cmd,
                 remove_cmd, rename_cmd, orderinfo_cmd, blacklist_cmd, unblacklist_cmd, list_cmd, listadd_cmd,
                 listremove_cmd, queue_cmd, set_group, unset_cmd, mypay_cmd, pay_cmd, buyer_cmd, stars_cmd,
-                givestars_cmd, free_group, help_cmd]
+                givestars_cmd, free_group, notify_cmd, help_cmd]
 
 
 # ==========================================================================
