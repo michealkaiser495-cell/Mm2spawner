@@ -1,5 +1,5 @@
 """
-Food and b4u Order Desk v8 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v9 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -55,11 +55,13 @@ CLOSE_DELAY_SECONDS = 5
 FREE_ORDER_STARS = 10                   # vouch stars needed for /free order
 NOTIFY_COOLDOWN_SECONDS = 30
 # ---- AI support (Claude) --------------------------------------------------
-AI_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()  # set this env var to turn AI on
-AI_MODEL_DEFAULT = "claude-sonnet-5-5"                    # owner can change with /aisupport
-AI_MAX_TOKENS = 600                                       # keep replies short = cheap
-AI_EFFORT = "low"                                         # low thinking = fewer tokens = cheaper
-AI_MAX_INPUT = 800                                        # trim the customer's question
+# You don't need an API key: log into Claude with the Anthropic CLI (`ant auth login`) or set
+# ANTHROPIC_AUTH_TOKEN. An ANTHROPIC_API_KEY still works too, if you'd rather use one.
+AI_MODEL_DEFAULT = "claude-opus-4-6"                      # owner can change with /aisupport
+AI_MAX_TOKENS = 350                                       # short replies = fewest tokens
+AI_EFFORT = "low"                                         # least thinking = fewest tokens
+AI_MAX_INPUT = 600                                        # trim the question to save tokens
+AI_OAUTH_BETA = "oauth-2025-04-20"                        # lets a Claude login work on the Messages API
 AI_COOLDOWN_SECONDS = 6                                   # per-user, stops spam / runaway cost
 AI_MAX_PER_TICKET = 15                                    # hard cap of AI replies per ticket
 GEO_USER_AGENT = "FoodAndB4uBot/1.0 (Discord order bot)"
@@ -134,7 +136,7 @@ class Store:
         "payinfo": {},           # {user_id: {method: address}}  saved with /set payment
         "buyer_role": None,      # given to customers when their order is completed (/buyer)
         "ai_enabled": False,     # owner turned on AI help for customers in support tickets (/aisupport)
-        "ai_model": AI_MODEL_DEFAULT,
+        "ai_model": AI_MODEL_DEFAULT,  # set below if a retired default is stored
         "ai_calls": 0,           # how many AI answers the bot has given (for the owner's info)
         "vouch_channel": None,   # where vouches are posted (/set vouch)
         "vouch_counter": 0,
@@ -182,6 +184,8 @@ class Store:
         for key, value in self.GUILD_DEFAULTS.items():
             if key not in g:
                 g[key] = copy.deepcopy(value)
+        if g.get("ai_model") in ("claude-sonnet-5-5", "claude-sonnet-5", None):
+            g["ai_model"] = AI_MODEL_DEFAULT               # move old default onto the current one
         if isinstance(g["clocked_in"], list):          # migrate v1 format
             now = int(time.time())
             g["clocked_in"] = {str(uid): now for uid in g["clocked_in"]}
@@ -1064,7 +1068,8 @@ class ClaimedView(SafeView):
                        custom_id="fb4u:order:aiassist", row=2)
     async def aiassist(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not ai_ready():
-            return await send_error(interaction, "AI isn't set up. The owner must set the `ANTHROPIC_API_KEY` env var.")
+            return await send_error(interaction, "AI isn't set up. The owner must log into Claude (`ant auth login`) "
+                                                 "or set `ANTHROPIC_AUTH_TOKEN`, then restart the bot.")
         await interaction.response.send_modal(ChefAIModal())
 
     @discord.ui.button(label="Payment Info", emoji="💸", style=discord.ButtonStyle.success,
@@ -2195,35 +2200,61 @@ _ai_client: Optional[anthropic.AsyncAnthropic] = None
 ai_cooldowns: dict[int, float] = {}
 
 CUSTOMER_SYSTEM = (
-    "You are the friendly support assistant for \"{brand}\", a Discord food-ordering service. "
-    "How it works: customers open a ticket, tell us the restaurant and their delivery address, send a "
-    "screenshot of their cart with the order total, and pay only a fraction of that total ({price_rule}); "
-    "then a chef claims the order and gets it delivered. Customers earn a star for leaving a vouch after each "
-    "order, and {free_stars} stars = a free order.\n\n"
-    "Answer the customer's question in a warm, short, helpful way (1-4 sentences, light emoji is fine). "
-    "Only answer questions about using this service and ordering food. For anything about a specific payment, "
-    "refund, a problem with their order, or anything you are unsure of, tell them a staff member will help them "
-    "shortly and to wait in the ticket. Never ask for passwords, card numbers, or login details, and never make "
-    "up prices, times, or order details you were not given. Do not help with anything illegal."
+    "Support assistant for {brand}, a Discord food-ordering service: customers order via a ticket and pay "
+    "{price_rule} of their total; {free_stars} vouch stars = a free order. Answer in 1-3 short sentences, "
+    "friendly. Only help with using the service. Send any payment/refund/order problem to staff. Never ask for "
+    "passwords or card numbers; never invent prices or order details; refuse anything illegal."
 )
 CHEF_SYSTEM = (
-    "You are an assistant helping a staff member (\"chef\") handle a customer's food-delivery order ticket for "
-    "\"{brand}\". Be concise and practical. You can summarize the order, draft a short polite message to the "
-    "customer, or suggest the next step. Use only the order details provided. Do not invent prices or addresses, "
-    "and do not help with anything illegal."
+    "Help a staff member handle a food-order ticket for {brand}. Be concise (a short summary, a drafted reply, "
+    "or the next step). Use only the details given; don't invent prices or addresses; refuse anything illegal."
 )
+
+
+def credential_source() -> Optional[str]:
+    """Which Claude credential the bot can see, if any (for status messages)."""
+    if os.getenv("ANTHROPIC_API_KEY", "").strip():
+        return "API key (ANTHROPIC_API_KEY)"
+    if os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip():
+        return "Claude login token (ANTHROPIC_AUTH_TOKEN)"
+    home = os.path.expanduser("~")
+    candidates = [os.getenv("ANTHROPIC_CONFIG_DIR", "").strip(),
+                  os.path.join(home, ".config", "anthropic"),
+                  os.path.join(os.getenv("XDG_CONFIG_HOME", ""), "anthropic") if os.getenv("XDG_CONFIG_HOME") else "",
+                  os.path.join(os.getenv("APPDATA", ""), "anthropic") if os.getenv("APPDATA") else ""]
+    for base in filter(None, candidates):
+        try:
+            if os.path.isdir(base) and any(True for _ in os.scandir(base)):
+                return "Claude login (`ant auth login`)"
+        except OSError:
+            continue
+    return None
 
 
 def ai_ready() -> bool:
-    return bool(AI_API_KEY)
+    return credential_source() is not None
 
 
 def get_ai_client() -> Optional[anthropic.AsyncAnthropic]:
+    """Build a client from whatever credential exists: API key, login token, or on-disk Claude login."""
     global _ai_client
-    if not AI_API_KEY:
+    if _ai_client is not None:
+        return _ai_client
+    if credential_source() is None:
         return None
-    if _ai_client is None:
-        _ai_client = anthropic.AsyncAnthropic(api_key=AI_API_KEY)
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    token = os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip()
+    try:
+        if key:
+            _ai_client = anthropic.AsyncAnthropic(api_key=key)
+        elif token:
+            _ai_client = anthropic.AsyncAnthropic(auth_token=token,
+                                                  default_headers={"anthropic-beta": AI_OAUTH_BETA})
+        else:  # on-disk Claude login (OAuth) — SDK resolves it; add the beta so the Messages API accepts it
+            _ai_client = anthropic.AsyncAnthropic(default_headers={"anthropic-beta": AI_OAUTH_BETA})
+    except anthropic.AnthropicError as exc:
+        log.warning("Could not start the AI client: %s", exc)
+        return None
     return _ai_client
 
 
@@ -2231,27 +2262,36 @@ async def ai_ask(guild_id: int, system: str, question: str) -> tuple[bool, str]:
     """Ask Claude. Returns (ok, text). Never raises — turns every error into a friendly message."""
     client = get_ai_client()
     if client is None:
-        return False, ("🤖 AI help isn't switched on. The owner needs to set the `ANTHROPIC_API_KEY` "
-                       "environment variable (and `/aisupport on`).")
+        return False, ("🤖 AI help isn't set up yet. Log into Claude (`ant auth login`) or set "
+                       "`ANTHROPIC_AUTH_TOKEN`, then restart the bot.")
     g = store.guild(guild_id)
     model = g.get("ai_model") or AI_MODEL_DEFAULT
-    try:
-        resp = await client.messages.create(
-            model=model,
-            max_tokens=AI_MAX_TOKENS,
-            system=system,
-            messages=[{"role": "user", "content": question[:AI_MAX_INPUT]}],
-            output_config={"effort": AI_EFFORT},
-        )
-    except anthropic.AuthenticationError:
-        return False, "🤖 The AI key was rejected. The owner should check `ANTHROPIC_API_KEY`."
-    except anthropic.RateLimitError:
-        return False, "🤖 The AI is busy right now — try again in a moment."
-    except anthropic.APIError as exc:
-        log.warning("AI call failed: %s", exc)
-        return False, "🤖 The AI couldn't answer right now. A staff member will help you."
-    except Exception as exc:  # never let the AI crash the bot
-        log.warning("AI unexpected error: %s", exc)
+    # No `thinking` param -> Opus 4.6 answers without a thinking budget = fewest tokens.
+    base = dict(model=model, max_tokens=AI_MAX_TOKENS, system=system,
+                messages=[{"role": "user", "content": question[:AI_MAX_INPUT]}])
+    resp = None
+    for kwargs in ({**base, "output_config": {"effort": AI_EFFORT}}, base):
+        try:
+            resp = await client.messages.create(**kwargs)
+            break
+        except anthropic.BadRequestError as exc:
+            if kwargs is base:   # already stripped the optional field -> real problem
+                log.warning("AI bad request: %s", exc)
+                return False, "🤖 The AI couldn't answer that one. A staff member will help you."
+            log.info("AI: retrying without output_config (%s)", exc)
+            continue             # retry once without output_config (older models reject it)
+        except anthropic.AuthenticationError:
+            return False, ("🤖 Claude login failed. Log in again (`ant auth login`) or check "
+                           "`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`, then restart.")
+        except anthropic.RateLimitError:
+            return False, "🤖 The AI is busy right now — try again in a moment."
+        except anthropic.APIError as exc:
+            log.warning("AI call failed: %s", exc)
+            return False, "🤖 The AI couldn't answer right now. A staff member will help you."
+        except Exception as exc:  # never let the AI crash the bot
+            log.warning("AI unexpected error: %s", exc)
+            return False, "🤖 The AI couldn't answer right now. A staff member will help you."
+    if resp is None:
         return False, "🤖 The AI couldn't answer right now. A staff member will help you."
     if resp.stop_reason == "refusal":
         return False, "🤖 I can't help with that one — a staff member will take it from here."
@@ -2328,7 +2368,8 @@ async def run_chef_ai(interaction: discord.Interaction, question: str) -> None:
     if not is_staff(interaction.user, store.guild(channel.guild.id)):
         return await send_error(interaction, "Only chefs or the owner can use AI assist.")
     if not ai_ready():
-        return await send_error(interaction, "AI isn't set up. The owner must set the `ANTHROPIC_API_KEY` env var.")
+        return await send_error(interaction, "AI isn't set up. The owner must log into Claude (`ant auth login`) "
+                                             "or set `ANTHROPIC_AUTH_TOKEN`, then restart the bot.")
     left = ai_cooldown_left(interaction.user.id)
     if left > 0:
         return await send_error(interaction, f"One sec — try again in {left:.0f}s.")
@@ -3197,13 +3238,14 @@ async def aisupport_cmd(interaction: discord.Interaction, switch: app_commands.C
                           color=COLOR_GREEN if on else COLOR_DARK,
                           description=("Customers now get an **Ask AI** helper in support tickets. 🎉" if on else
                                        "AI support for customers is now off. Chefs can still use **AI Assist** / `/ai`."))
-    embed.add_field(name="🔑 API key", value="✅ Set" if ai_ready() else
-                    "❌ **Missing** — set the `ANTHROPIC_API_KEY` env var, then restart the bot", inline=True)
+    src = credential_source()
+    embed.add_field(name="🔐 Claude login", value=f"✅ {src}" if src else
+                    "❌ **Not logged in** — run `ant auth login` (or set `ANTHROPIC_AUTH_TOKEN`), then restart", inline=True)
     embed.add_field(name="🧠 Model", value=f"`{g['ai_model']}`", inline=True)
     embed.add_field(name="📊 AI answers given", value=str(g.get("ai_calls", 0)), inline=True)
-    if on and not ai_ready():
-        embed.add_field(name="⚠️ Heads up", value="AI is enabled but there's no API key yet, so it can't answer. "
-                        "Set `ANTHROPIC_API_KEY` and restart.", inline=False)
+    if on and not src:
+        embed.add_field(name="⚠️ Heads up", value="AI is enabled but you're not logged into Claude yet, so it can't "
+                        "answer. Run `ant auth login` (or set `ANTHROPIC_AUTH_TOKEN`) and restart.", inline=False)
     embed.add_field(name="💡 Chef tool", value="Chefs can always use **🤖 AI Assist** on a claimed order or `/ai <question>`.",
                     inline=False)
     await interaction.response.send_message(embed=stamp(embed), ephemeral=True)
@@ -3366,8 +3408,9 @@ class FoodBot(discord.Client):
                                          scopes=("bot", "applications.commands"))
         log.info("Logged in as %s (%s) - in %d server(s)", self.user, self.user.id, len(self.guilds))
         log.info("Typed answers: %s", "ON" if TYPED_INPUT else "OFF (forms only - enable Message Content Intent to allow typing)")
-        log.info("AI support: %s", f"key set, model default {AI_MODEL_DEFAULT} (owner enables per-server with /aisupport)"
-                 if ai_ready() else "OFF (set ANTHROPIC_API_KEY env var to enable)")
+        src = credential_source()
+        log.info("AI support: %s", f"logged in via {src}, model {AI_MODEL_DEFAULT} (owner enables with /aisupport on)"
+                 if src else "not logged in (run `ant auth login` or set ANTHROPIC_AUTH_TOKEN to enable)")
         log.info("Invite link: %s", invite)
         if not self.guilds:
             log.warning("The bot is NOT in any server yet. Open the invite link above to add it.")

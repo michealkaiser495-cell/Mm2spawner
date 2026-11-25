@@ -1,4 +1,4 @@
-# Food and b4u Order Desk bot (v8)
+# Food and b4u Order Desk bot (v9)
 
 1. `pip install -U -r requirements.txt`  (needs discord.py 2.7+)
 2. Put your token in `TOKEN` at the top of `main.py` (or set `DISCORD_TOKEN`).
@@ -28,8 +28,11 @@ vouch channel, +1 star each). Everyone: /stars, /free order (10 stars = free ord
 Claimed orders show a copyable delivery address and a Full Address button (exact street/city/state/ZIP via
 the free US Census geocoder, OpenStreetMap as fallback). /notify DMs the customer a link to their ticket.
 
-AI support (Claude, optional): set the ANTHROPIC_API_KEY environment variable and restart, then the owner runs
-/aisupport on. Customers get an "Ask AI" button in support tickets; chefs get an "AI Assist" button on claimed
-orders and the /ai command. Model defaults to claude-sonnet-5-5 (change with /aisupport ... model:). Replies are
-short and low-effort to keep API cost down. Without the key, everything else works unchanged.
+AI support (Claude, optional) — NO API KEY NEEDED:
+  1. Log into Claude on the PC that runs the bot: `ant auth login` (Anthropic CLI). The bot reads that login
+     automatically. (Alternatives: set ANTHROPIC_AUTH_TOKEN, or an ANTHROPIC_API_KEY if you prefer a key.)
+  2. Restart the bot, then the owner runs /aisupport on.
+Customers get an "Ask AI" button in support tickets; chefs get an "AI Assist" button on claimed orders and /ai.
+Model defaults to claude-opus-4-6 (change with /aisupport ... model:). Replies use the fewest tokens possible
+(short answers, no thinking budget, low effort). Without a Claude login, everything else works unchanged.
   pip install -U -r requirements.txt   (now also installs the anthropic SDK)
