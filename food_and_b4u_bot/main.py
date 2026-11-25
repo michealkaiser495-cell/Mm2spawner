@@ -1,5 +1,5 @@
 """
-Food and b4u Order Desk v9 - Discord ticket bot (discord.py 2.7+)
+Food and b4u Order Desk v10 - Discord ticket bot (discord.py 2.7+)
 
 Run:
     pip install -U "discord.py>=2.7"
@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -38,7 +39,10 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
-import anthropic
+try:
+    import anthropic  # optional: only needed for the AI support feature
+except ImportError:
+    anthropic = None  # the bot still runs fully; AI stays off until the library is installed
 import discord
 from discord import app_commands
 
@@ -55,8 +59,10 @@ CLOSE_DELAY_SECONDS = 5
 FREE_ORDER_STARS = 10                   # vouch stars needed for /free order
 NOTIFY_COOLDOWN_SECONDS = 30
 # ---- AI support (Claude) --------------------------------------------------
-# You don't need an API key: log into Claude with the Anthropic CLI (`ant auth login`) or set
-# ANTHROPIC_AUTH_TOKEN. An ANTHROPIC_API_KEY still works too, if you'd rather use one.
+# To turn AI on, put ONE Claude credential here (easiest), or set it as an env var,
+# or run `ant auth login`. An API key starts with "sk-ant-"; a login token is fine too.
+# Leave it "" to keep AI off (the rest of the bot works either way).
+AI_TOKEN = ""                                            # <-- paste your Claude key/token here (optional)
 AI_MODEL_DEFAULT = "claude-opus-4-6"                      # owner can change with /aisupport
 AI_MAX_TOKENS = 350                                       # short replies = fewest tokens
 AI_EFFORT = "low"                                         # least thinking = fewest tokens
@@ -2211,8 +2217,20 @@ CHEF_SYSTEM = (
 )
 
 
+def _pasted_token() -> str:
+    return AI_TOKEN.strip()
+
+
+def _is_api_key(cred: str) -> bool:
+    return cred.startswith("sk-ant-")
+
+
 def credential_source() -> Optional[str]:
     """Which Claude credential the bot can see, if any (for status messages)."""
+    if anthropic is None:
+        return None
+    if _pasted_token():
+        return "pasted token in main.py"
     if os.getenv("ANTHROPIC_API_KEY", "").strip():
         return "API key (ANTHROPIC_API_KEY)"
     if os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip():
@@ -2235,23 +2253,26 @@ def ai_ready() -> bool:
     return credential_source() is not None
 
 
-def get_ai_client() -> Optional[anthropic.AsyncAnthropic]:
-    """Build a client from whatever credential exists: API key, login token, or on-disk Claude login."""
+def get_ai_client():
+    """Build a client from whatever credential exists: pasted token, env var, or on-disk Claude login."""
     global _ai_client
+    if anthropic is None:
+        return None
     if _ai_client is not None:
         return _ai_client
     if credential_source() is None:
         return None
-    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    token = os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip()
+    pasted = _pasted_token()
+    key = pasted if (pasted and _is_api_key(pasted)) else os.getenv("ANTHROPIC_API_KEY", "").strip()
+    token = pasted if (pasted and not _is_api_key(pasted)) else os.getenv("ANTHROPIC_AUTH_TOKEN", "").strip()
+    oauth = {"anthropic-beta": AI_OAUTH_BETA}
     try:
         if key:
             _ai_client = anthropic.AsyncAnthropic(api_key=key)
         elif token:
-            _ai_client = anthropic.AsyncAnthropic(auth_token=token,
-                                                  default_headers={"anthropic-beta": AI_OAUTH_BETA})
+            _ai_client = anthropic.AsyncAnthropic(auth_token=token, default_headers=oauth)
         else:  # on-disk Claude login (OAuth) — SDK resolves it; add the beta so the Messages API accepts it
-            _ai_client = anthropic.AsyncAnthropic(default_headers={"anthropic-beta": AI_OAUTH_BETA})
+            _ai_client = anthropic.AsyncAnthropic(default_headers=oauth)
     except anthropic.AnthropicError as exc:
         log.warning("Could not start the AI client: %s", exc)
         return None
@@ -3408,9 +3429,13 @@ class FoodBot(discord.Client):
                                          scopes=("bot", "applications.commands"))
         log.info("Logged in as %s (%s) - in %d server(s)", self.user, self.user.id, len(self.guilds))
         log.info("Typed answers: %s", "ON" if TYPED_INPUT else "OFF (forms only - enable Message Content Intent to allow typing)")
-        src = credential_source()
-        log.info("AI support: %s", f"logged in via {src}, model {AI_MODEL_DEFAULT} (owner enables with /aisupport on)"
-                 if src else "not logged in (run `ant auth login` or set ANTHROPIC_AUTH_TOKEN to enable)")
+        if anthropic is None:
+            log.info("AI support: OFF (AI library not installed — run `pip install anthropic`)")
+        else:
+            src = credential_source()
+            log.info("AI support: %s", f"connected via {src}, model {AI_MODEL_DEFAULT} (owner enables with /aisupport on)"
+                     if src else "no Claude credential yet (paste one in main.py, run `ant auth login`, "
+                     "or set ANTHROPIC_AUTH_TOKEN)")
         log.info("Invite link: %s", invite)
         if not self.guilds:
             log.warning("The bot is NOT in any server yet. Open the invite link above to add it.")
@@ -3590,6 +3615,23 @@ def claim_single_instance() -> bool:
     return True
 
 
+def ensure_anthropic() -> None:
+    """Best-effort: install the `anthropic` library if it's missing, so AI can work with zero setup."""
+    global anthropic
+    if anthropic is not None:
+        return
+    log.info("Installing the AI library (anthropic)… one-time, please wait.")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "anthropic"],
+                       check=True, timeout=240)
+        import anthropic as _a
+        anthropic = _a
+        log.info("AI library installed.")
+    except Exception as exc:
+        log.warning("Couldn't auto-install the AI library (%s). The bot runs fine; AI stays off. "
+                    "To enable it later, run:  pip install anthropic", exc)
+
+
 def setup_logs() -> None:
     discord.utils.setup_logging(level=logging.INFO)
     try:
@@ -3610,6 +3652,7 @@ def main() -> None:
     except (AttributeError, ValueError):
         pass
     setup_logs()
+    ensure_anthropic()
     disable_quick_edit()
     discord.VoiceClient.warn_nacl = False     # no voice features used - hide noisy warnings
     discord.VoiceClient.warn_dave = False

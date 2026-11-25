@@ -1,4 +1,4 @@
-# Food and b4u Order Desk bot (v9)
+# Food and b4u Order Desk bot (v10)
 
 1. `pip install -U -r requirements.txt`  (needs discord.py 2.7+)
 2. Put your token in `TOKEN` at the top of `main.py` (or set `DISCORD_TOKEN`).
@@ -36,3 +36,7 @@ Customers get an "Ask AI" button in support tickets; chefs get an "AI Assist" bu
 Model defaults to claude-opus-4-6 (change with /aisupport ... model:). Replies use the fewest tokens possible
 (short answers, no thinking budget, low effort). Without a Claude login, everything else works unchanged.
   pip install -U -r requirements.txt   (now also installs the anthropic SDK)
+
+The bot never crashes if the AI library is missing — it auto-installs `anthropic` on first run and, if that
+fails, just runs with AI off. Easiest way to turn AI on: paste a Claude key/token into AI_TOKEN near the top
+of main.py (same spot idea as the Discord token).
