@@ -137,7 +137,17 @@ export interface SwapTxResponse {
   simulationError?: unknown;
 }
 
-export async function buildSwapTransaction(quote: QuoteResponse, userPublicKey: string): Promise<SwapTxResponse> {
+export type SwapFeeLevel = 'eco' | 'normal' | 'turbo';
+
+// maxLamports is the hard ceiling on the priority fee Jupiter attaches, so a low cap keeps swaps
+// cheap regardless of priorityLevel. (Jupiter's API accepts medium/high/veryHigh, not "low".)
+const SWAP_FEE_TIERS: Record<SwapFeeLevel, { maxLamports: number; priorityLevel: 'medium' | 'high' | 'veryHigh' }> = {
+  eco: { maxLamports: 100_000, priorityLevel: 'medium' }, // ≤0.0001 SOL
+  normal: { maxLamports: 1_000_000, priorityLevel: 'medium' }, // ≤0.001 SOL
+  turbo: { maxLamports: 5_000_000, priorityLevel: 'high' }, // ≤0.005 SOL
+};
+
+export async function buildSwapTransaction(quote: QuoteResponse, userPublicKey: string, feeLevel: SwapFeeLevel = 'eco'): Promise<SwapTxResponse> {
   return getJson<SwapTxResponse>(`${BASE}/swap/v1/swap`, {
     method: 'POST',
     body: JSON.stringify({
@@ -146,9 +156,8 @@ export async function buildSwapTransaction(quote: QuoteResponse, userPublicKey: 
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
       dynamicSlippage: false,
-      prioritizationFeeLamports: {
-        priorityLevelWithMaxLamports: { maxLamports: 1_000_000, priorityLevel: 'medium' },
-      },
+      // Nocta takes no platform fee — users pay only Solana's network cost.
+      prioritizationFeeLamports: { priorityLevelWithMaxLamports: SWAP_FEE_TIERS[feeLevel] },
     }),
   });
 }

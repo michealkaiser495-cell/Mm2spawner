@@ -30,6 +30,7 @@ export interface Settings {
   testnetReferenceValues: boolean;
   mainnetAcknowledged: boolean;
   slippageBps: number;
+  feeLevel: 'eco' | 'normal' | 'turbo';
   clipboardClearSeconds: number;
 }
 
@@ -49,6 +50,7 @@ export const DEFAULT_SETTINGS: Settings = {
   testnetReferenceValues: true,
   mainnetAcknowledged: false,
   slippageBps: 50,
+  feeLevel: 'eco', // cheapest priority fee by default
   clipboardClearSeconds: 60,
 };
 
@@ -80,6 +82,7 @@ function sanitize(p: Partial<Settings> | undefined): Partial<Settings> {
   if (out.accent && !(out.accent in ACCENTS)) delete out.accent;
   if (typeof out.autoLockMinutes !== 'number' || out.autoLockMinutes < 1 || out.autoLockMinutes > 240) delete out.autoLockMinutes;
   if (typeof out.slippageBps !== 'number' || out.slippageBps < 1 || out.slippageBps > 5000) delete out.slippageBps;
+  if (!['eco', 'normal', 'turbo'].includes(out.feeLevel as string)) delete out.feeLevel;
   return out;
 }
 

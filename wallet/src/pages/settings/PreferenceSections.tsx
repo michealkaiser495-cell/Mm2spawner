@@ -82,8 +82,16 @@ function RpcEditor({ id }: { id: SolanaNetwork }) {
   );
 }
 
+const FEE_LEVELS: { value: 'eco' | 'normal' | 'turbo'; label: string; desc: string }[] = [
+  { value: 'eco', label: 'Eco', desc: 'Cheapest. Minimal priority fee.' },
+  { value: 'normal', label: 'Normal', desc: 'Balanced speed and cost.' },
+  { value: 'turbo', label: 'Turbo', desc: 'Fastest during congestion.' },
+];
+
 export function NetworkSection() {
   const network = useSettings((s) => s.network);
+  const feeLevel = useSettings((s) => s.feeLevel);
+  const update = useSettings((s) => s.update);
   const { request, dialog } = useSwitchNetwork();
   return (
     <div className="space-y-5">
@@ -98,6 +106,23 @@ export function NetworkSection() {
             {n.id === network && <Check className="h-5 w-5 text-accent" />}
           </button>
         ))}
+      </SettingsCard>
+      <SettingsCard title="Transaction fees" desc="Nocta charges no fees. You pay only Solana’s network cost (≈0.000005 SOL base) plus the priority fee you choose below.">
+        <div className="py-3">
+          <div className="grid grid-cols-3 gap-2">
+            {FEE_LEVELS.map((f) => (
+              <button
+                key={f.value}
+                onClick={() => update({ feeLevel: f.value })}
+                aria-pressed={feeLevel === f.value}
+                className={cn('rounded-xl border p-3 text-left transition-all', feeLevel === f.value ? 'accent-ring border-transparent bg-white/[0.08]' : 'border-white/[0.07] hover:bg-white/[0.05]')}
+              >
+                <span className="block font-semibold">{f.label}</span>
+                <span className="mt-0.5 block text-xs text-mist-400">{f.desc}</span>
+              </button>
+            ))}
+          </div>
+        </div>
       </SettingsCard>
       <SettingsCard title="RPC endpoints" desc="Public endpoints are rate-limited. For reliable Mainnet use, add a dedicated provider URL (Helius, Triton, QuickNode…). Endpoints are verified by genesis hash.">
         {NETWORK_LIST.map((n) => (

@@ -9,9 +9,9 @@ import { loadLookupTables, simulate, type PreparedTransaction } from './transact
  * decode instructions (resolving lookup tables), run the security guard, require the
  * Jupiter program, and simulate against the RPC. Nothing is signed here.
  */
-export async function prepareSwap(conn: Connection, quote: QuoteResponse, owner: string): Promise<PreparedTransaction> {
+export async function prepareSwap(conn: Connection, quote: QuoteResponse, owner: string, feeLevel: 'eco' | 'normal' | 'turbo' = 'eco'): Promise<PreparedTransaction> {
   const ownerPk = new PublicKey(owner);
-  const res = await buildSwapTransaction(quote, owner);
+  const res = await buildSwapTransaction(quote, owner, feeLevel);
   const tx = VersionedTransaction.deserialize(base64ToBytes(res.swapTransaction));
   const lookupTables = await loadLookupTables(conn, tx);
   const guard = inspectTransaction(tx, ownerPk, lookupTables, new Set([JUPITER_PROGRAM_ID]));

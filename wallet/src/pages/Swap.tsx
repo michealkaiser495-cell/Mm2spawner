@@ -53,6 +53,7 @@ export function Swap() {
   const slippageBps = useSettings((s) => s.slippageBps);
   const requirePw = useSettings((s) => s.requirePasswordToSign);
   const fetchMarketData = useSettings((s) => s.fetchMarketData);
+  const feeLevel = useSettings((s) => s.feeLevel);
   const update = useSettings((s) => s.update);
   const { request: switchNetwork, dialog: switchDialog } = useSwitchNetwork();
 
@@ -133,7 +134,7 @@ export function Swap() {
     setPreparing(true);
     setPrepareError(undefined);
     try {
-      const prep = await prepareSwap(conn, q, account.publicKey);
+      const prep = await prepareSwap(conn, q, account.publicKey, feeLevel);
       setPrepared(prep);
       setReviewOpen(true);
     } catch (e) {

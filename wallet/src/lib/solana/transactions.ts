@@ -53,15 +53,32 @@ export interface PreparedTransaction {
   errors: string[];
 }
 
-const MAX_PRIORITY_MICROLAMPORTS = 200_000;
+/**
+ * Transaction fee priority. Solana's base fee is fixed (5000 lamports/signature); the only
+ * lever is the *priority fee* (price per compute unit). Lower = cheaper but slower to land
+ * during congestion. "eco" is the cheapest that still lands under normal conditions.
+ */
+export type FeeLevel = 'eco' | 'normal' | 'turbo';
 
-async function priorityFee(conn: Connection, writable: PublicKey[]): Promise<number> {
+// [percentile of recent fees, hard cap in micro-lamports per compute unit].
+const FEE_TIERS: Record<FeeLevel, { percentile: number; capMicroLamports: number }> = {
+  eco: { percentile: 0.25, capMicroLamports: 20_000 },
+  normal: { percentile: 0.5, capMicroLamports: 200_000 },
+  turbo: { percentile: 0.9, capMicroLamports: 2_000_000 },
+};
+
+function percentile(sorted: number[], p: number): number {
+  if (!sorted.length) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+}
+
+/** Price per compute unit (micro-lamports). On a 30k-CU transfer, eco adds ≈0.0000006 SOL. */
+async function priorityFee(conn: Connection, writable: PublicKey[], level: FeeLevel = 'eco'): Promise<number> {
+  const tier = FEE_TIERS[level];
   try {
     const fees = await conn.getRecentPrioritizationFees({ lockedWritableAccounts: writable });
-    const vals = fees.map((f) => f.prioritizationFee).sort((a, b) => a - b);
-    if (!vals.length) return 0;
-    const median = vals[Math.floor(vals.length / 2)];
-    return Math.min(median, MAX_PRIORITY_MICROLAMPORTS);
+    const vals = fees.map((f) => f.prioritizationFee).filter((v) => v > 0).sort((a, b) => a - b);
+    return Math.min(percentile(vals, tier.percentile), tier.capMicroLamports);
   } catch {
     return 0;
   }
@@ -113,6 +130,7 @@ export async function prepareTransfer(params: {
   asset: TransferAsset;
   amount: bigint;
   ownerLamports: bigint;
+  feeLevel?: FeeLevel;
 }): Promise<PreparedTransaction> {
   const { conn, asset, amount, ownerLamports } = params;
   const from = new PublicKey(params.owner);
@@ -173,7 +191,7 @@ export async function prepareTransfer(params: {
       );
   }
 
-  const cuPrice = await priorityFee(conn, [from]);
+  const cuPrice = await priorityFee(conn, [from], params.feeLevel);
   const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
 
   // First pass: simulate with a generous compute limit to measure usage.

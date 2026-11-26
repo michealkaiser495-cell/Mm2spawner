@@ -39,6 +39,7 @@ export function Send() {
   const account = useActiveAccount();
   const getKeypair = useWallet((s) => s.getKeypair);
   const requirePw = useSettings((s) => s.requirePasswordToSign);
+  const feeLevel = useSettings((s) => s.feeLevel);
   const { conn, network, config } = useNetwork();
   const { fmt } = useFiat();
   const p = usePortfolio();
@@ -106,7 +107,7 @@ export function Send() {
       const transferAsset: TransferAsset = asset.isNative
         ? { kind: 'sol' }
         : { kind: 'spl', mint: asset.mint, decimals: asset.decimals, programId: asset.holding!.programId, holding: asset.holding! };
-      const prep = await prepareTransfer({ conn, owner: account.publicKey, recipient: addr.pubkey.toBase58(), asset: transferAsset, amount, ownerLamports: p.lamports ?? 0n });
+      const prep = await prepareTransfer({ conn, owner: account.publicKey, recipient: addr.pubkey.toBase58(), asset: transferAsset, amount, ownerLamports: p.lamports ?? 0n, feeLevel });
       setPrepared(prep);
       setStep('review');
     } catch (e) {
