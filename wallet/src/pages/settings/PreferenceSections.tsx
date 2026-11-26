@@ -245,7 +245,7 @@ export function AboutSection() {
         <SettingRow title="Version">
           <span className="font-mono text-sm text-mist-300">{__APP_VERSION__}</span>
         </SettingRow>
-        <SettingRow title="Chains" desc="Solana — send & receive · Litecoin — receive" />
+        <SettingRow title="Chains" desc="Solana — send, receive & swap · Bitcoin, Ethereum, Litecoin, Dogecoin & EVM L2s — receive" />
         <SettingRow title="Key derivation" desc="BIP-39 · SLIP-0010 ed25519 · m/44'/501'/n'/0'" />
         <SettingRow title="Vault encryption" desc="PBKDF2-SHA256 (600,000 iterations) → AES-256-GCM via WebCrypto" />
         <SettingRow title="Open-source libraries" desc="@solana/web3.js, @solana/spl-token, @scure/bip39, micro-key-producer, React, TanStack Query" />

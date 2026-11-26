@@ -27,10 +27,21 @@ function hue(str: string) {
   return h;
 }
 
-function LtcLogo({ size }: { size: number }) {
+// Brand glyph logos for the chains Nocta derives addresses for.
+const CHAIN_GLYPHS: Record<string, { glyph: string; bg: string }> = {
+  bitcoin: { glyph: '₿', bg: 'linear-gradient(135deg,#f7931a,#b45e06)' },
+  ethereum: { glyph: 'Ξ', bg: 'linear-gradient(135deg,#627eea,#3c4fa0)' },
+  litecoin: { glyph: 'Ł', bg: 'linear-gradient(135deg,#4e5a6b,#2b3340)' },
+  dogecoin: { glyph: 'Ð', bg: 'linear-gradient(135deg,#c2a633,#8a7420)' },
+  base: { glyph: 'Ξ', bg: 'linear-gradient(135deg,#2151f5,#0f3bd1)' },
+  polygon: { glyph: '⬡', bg: 'linear-gradient(135deg,#8247e5,#5a2fb0)' },
+  arbitrum: { glyph: 'Ξ', bg: 'linear-gradient(135deg,#28a0f0,#1a6fae)' },
+};
+
+function GlyphLogo({ glyph, bg, size }: { glyph: string; bg: string; size: number }) {
   return (
-    <span className="grid h-full w-full place-items-center rounded-full font-bold text-white" style={{ background: 'linear-gradient(135deg,#4e5a6b,#2b3340)', fontSize: size * 0.56 }} aria-hidden>
-      Ł
+    <span className="grid h-full w-full place-items-center rounded-full font-bold text-white" style={{ background: bg, fontSize: size * 0.54 }} aria-hidden>
+      {glyph}
     </span>
   );
 }
@@ -41,8 +52,13 @@ export function TokenIcon({ symbol, icon, mint, size = 40, isNative, className }
   const style = { width: size, height: size };
   if (isNative || (symbol === 'SOL' && mint === 'So11111111111111111111111111111111111111112'))
     return <span className={cn('inline-block shrink-0 overflow-hidden rounded-full', className)} style={style}><SolLogo /></span>;
-  if (mint === 'litecoin' || (symbol === 'LTC' && !icon))
-    return <span className={cn('inline-block shrink-0 overflow-hidden rounded-full', className)} style={style}><LtcLogo size={size} /></span>;
+  const glyph = mint ? CHAIN_GLYPHS[mint] : undefined;
+  if (glyph || (symbol === 'LTC' && !icon))
+    return (
+      <span className={cn('inline-block shrink-0 overflow-hidden rounded-full', className)} style={style}>
+        <GlyphLogo {...(glyph ?? CHAIN_GLYPHS.litecoin)} size={size} />
+      </span>
+    );
   const safeIcon = icon && /^https:\/\//.test(icon) ? icon : undefined;
   if (safeIcon && !failed)
     return (

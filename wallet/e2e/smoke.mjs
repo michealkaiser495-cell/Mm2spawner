@@ -98,13 +98,22 @@ const visit = async (hash, name, waitFor) => {
 await visit('/receive', '06-receive', 'Your Solana address');
 const shown = await page.getByTestId('receive-address').textContent();
 if (shown !== address) throw new Error('receive address mismatch');
-// Litecoin receive tab: a valid ltc1 address must be derived and shown.
+// Each external coin tab must derive a valid, correctly-formatted receive address.
+const externals = [
+  ['Bitcoin', /^bc1[0-9ac-hj-np-z]{20,}$/],
+  ['Ethereum', /^0x[0-9a-fA-F]{40}$/],
+  ['Litecoin', /^ltc1[0-9ac-hj-np-z]{20,}$/],
+  ['Dogecoin', /^D[1-9A-HJ-NP-Za-km-z]{25,39}$/],
+];
+for (const [name, re] of externals) {
+  await page.getByRole('button', { name: new RegExp(`^${name}`) }).click();
+  await page.getByTestId('external-address').waitFor({ timeout: 15000 });
+  const addr2 = (await page.getByTestId('external-address').textContent())?.trim();
+  if (!re.test(addr2)) throw new Error(`invalid ${name} address shown: ${addr2}`);
+  log(`${name} receive address ✓`, addr2);
+}
 await page.getByRole('button', { name: /^Litecoin/ }).click();
-await page.getByTestId('ltc-address').waitFor({ timeout: 15000 });
-const ltc = (await page.getByTestId('ltc-address').textContent())?.trim();
-if (!/^ltc1[0-9ac-hj-np-z]{20,}$/.test(ltc)) throw new Error(`invalid LTC address shown: ${ltc}`);
-log('litecoin receive address ✓', ltc);
-await page.waitForTimeout(1500);
+await page.waitForTimeout(1200);
 await shot('06b-receive-ltc');
 await visit('/buy', '07-buy', 'Not yet implemented');
 await visit('/send', '08-send', 'Send');

@@ -16,7 +16,7 @@ and never leave it. Every transaction is simulated and inspected before you can 
 | **Accounts** | Multiple recovery phrases and imported keys, derived accounts, rename, switch, remove |
 | **Dashboard** | Portfolio value, 24H / 7D / 1M / 1Y chart, token holdings, recent activity, token search |
 | **Send** | SOL and SPL / Token-2022 transfers, address validation, fee and rent estimates, simulation, review screen, pending / confirmed / failed states, duplicate-send guard |
-| **Receive** | Solana address + **Litecoin receive address** (derived from the same phrase, BIP-84/44), QR, copy/share, live LTC balance & history, wrong-network warnings |
+| **Receive** | Solana + **Bitcoin, Ethereum, Litecoin, Dogecoin** and EVM L2s (Base, Polygon, Arbitrum). Standard addresses derived from the same phrase, live balances, QR, history, explorer links. Receive-only for non-Solana chains. |
 | **Swap** | Live Jupiter quotes, slippage settings, price impact, minimum received, review, confirmation (Mainnet only) |
 | **Explore** | Trending, top and most-traded tokens, search by name, symbol or mint, token detail with chart, market data, audit flags and verification status |
 | **Activity** | Full history with filters, pagination and a detail view (balance changes, fee, programs, Explorer link) |
@@ -73,11 +73,20 @@ The fee-priority tier (Settings → Network) controls the optional priority fee:
 
 Solana's base fee (5,000 lamports/signature) is fixed by the network and cannot be zero.
 
-### Litecoin
+### Multi-chain receive
 
-Nocta derives a standard Litecoin receive address (native SegWit `ltc1…` by default, or legacy
-`L…`) from your recovery phrase, so any wallet can send LTC to it. Balance and history come from
-BlockCypher. Sending LTC from Nocta is not implemented yet; the Receive screen says so.
+From your single recovery phrase, Nocta derives standard, portable receive addresses for:
+
+| Coin | Address type | Verified against |
+| --- | --- | --- |
+| Bitcoin (BTC) | `bc1…` SegWit / `1…` legacy | BIP-84 / BIP-44 vectors |
+| Ethereum (ETH) + Base/Polygon/Arbitrum | `0x…` (EIP-55) | canonical ETH vector |
+| Litecoin (LTC) | `ltc1…` / `L…` | BIP-84/44 + on-chain |
+| Dogecoin (DOGE) | `D…` legacy | on-chain |
+
+UTXO balances/history come from BlockCypher; EVM balances from public JSON-RPC. Any wallet can
+send these coins to the shown address. **Sending** non-Solana coins from Nocta is not implemented
+yet (so no funds can be moved by mistake); the Receive screen states this clearly.
 
 ### Mainnet
 

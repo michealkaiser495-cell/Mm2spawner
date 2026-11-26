@@ -2,7 +2,8 @@ import { create } from 'zustand';
 import type { Keypair } from '@solana/web3.js';
 import { decryptVault, encryptVault, encryptWithKey, type EncryptedVault, InvalidPasswordError, isEncryptedVault } from '@/lib/crypto/vault';
 import { encodeSecretKey, isValidMnemonic, keypairFromMnemonic, normalizeMnemonic, parsePrivateKey } from '@/lib/crypto/keys';
-import { deriveLitecoinAddress, type LtcAddressType } from '@/lib/crypto/litecoin';
+import { type LtcAddressType } from '@/lib/crypto/litecoin';
+import { getExternalChain } from '@/lib/chains/external';
 import { randomId } from '@/lib/crypto/encoding';
 import { clearSession, getSession, hasSession, setSession, type KeyringSecret, type VaultPayload } from './session';
 
@@ -57,6 +58,7 @@ interface WalletState extends Meta {
   revealSecret: (password: string, keyringId: string) => Promise<KeyringSecret>;
   revealPrivateKey: (password: string, accountId: string) => Promise<string>;
   getKeypair: (accountId: string) => Keypair;
+  getExternalAddress: (accountId: string, chainId: string, variant?: string) => string | null;
   getLitecoinAddress: (accountId: string, type?: LtcAddressType) => string | null;
 }
 
@@ -367,16 +369,23 @@ export const useWallet = create<WalletState>((set, get) => {
     },
 
     /**
-     * Derive a Litecoin receive address from the active account's keyring. Only available for
-     * recovery-phrase keyrings (imported Solana private keys have no seed), and only unlocked.
+     * Derive an external-chain receive address (BTC, ETH, LTC, DOGE, …) from the active account's
+     * keyring. Only for recovery-phrase keyrings (imported Solana keys have no seed), and only
+     * while unlocked. Derivation happens in-memory; the mnemonic never leaves this call.
      */
-    getLitecoinAddress(accountId, type = 'segwit') {
+    getExternalAddress(accountId, chainId, variant) {
       if (!hasSession()) throw new Error('Wallet is locked');
       const acct = get().accounts.find((a) => a.id === accountId);
       if (!acct) return null;
       const kr = getSession().payload.keyrings.find((k) => k.id === acct.keyringId);
       if (!kr || kr.type !== 'mnemonic') return null;
-      return deriveLitecoinAddress(kr.mnemonic, type);
+      const chain = getExternalChain(chainId);
+      if (!chain) return null;
+      return chain.deriveAddress(kr.mnemonic, variant);
+    },
+
+    getLitecoinAddress(accountId, type = 'segwit') {
+      return get().getExternalAddress(accountId, 'litecoin', type);
     },
   };
 });
