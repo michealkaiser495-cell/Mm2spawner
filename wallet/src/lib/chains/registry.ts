@@ -8,12 +8,15 @@
  */
 import { checkAddress } from '../solana/address';
 import { explorerAddressUrl, explorerTxUrl, NETWORK_LIST, type SolanaNetwork } from '../solana/networks';
+import { isValidLitecoinAddress, ltcExplorerAddressUrl, ltcExplorerTxUrl } from '../crypto/litecoin';
 
 export interface ChainAdapter {
   id: string;
   name: string;
   nativeSymbol: string;
   enabled: boolean;
+  /** 'full' = balances & send; 'receive' = address + read-only balance/history only. */
+  support?: 'full' | 'receive';
   derivationPath?: string;
   networks: { id: string; label: string; isTestnet: boolean }[];
   isValidAddress(address: string): boolean;
@@ -26,11 +29,25 @@ export const solanaChain: ChainAdapter = {
   name: 'Solana',
   nativeSymbol: 'SOL',
   enabled: true,
+  support: 'full',
   derivationPath: "m/44'/501'/n'/0'",
   networks: NETWORK_LIST.map((n) => ({ id: n.id, label: n.label, isTestnet: n.isTestnet })),
   isValidAddress: (a) => checkAddress(a).valid,
   explorerTx: (n, s) => explorerTxUrl(n as SolanaNetwork, s),
   explorerAddress: (n, a) => explorerAddressUrl(n as SolanaNetwork, a),
+};
+
+export const litecoinChain: ChainAdapter = {
+  id: 'litecoin',
+  name: 'Litecoin',
+  nativeSymbol: 'LTC',
+  enabled: true,
+  support: 'receive',
+  derivationPath: "m/84'/2'/0'/0/0",
+  networks: [{ id: 'mainnet', label: 'Litecoin', isTestnet: false }],
+  isValidAddress: isValidLitecoinAddress,
+  explorerTx: (_n, s) => ltcExplorerTxUrl(s),
+  explorerAddress: (_n, a) => ltcExplorerAddressUrl(a),
 };
 
 const notYet = (id: string, name: string, sym: string): ChainAdapter => ({
@@ -44,6 +61,7 @@ const notYet = (id: string, name: string, sym: string): ChainAdapter => ({
 
 export const CHAINS: ChainAdapter[] = [
   solanaChain,
+  litecoinChain,
   notYet('ethereum', 'Ethereum', 'ETH'),
   notYet('bitcoin', 'Bitcoin', 'BTC'),
   notYet('base', 'Base', 'ETH'),

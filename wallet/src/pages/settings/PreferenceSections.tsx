@@ -83,7 +83,7 @@ function RpcEditor({ id }: { id: SolanaNetwork }) {
 }
 
 const FEE_LEVELS: { value: 'eco' | 'normal' | 'turbo'; label: string; desc: string }[] = [
-  { value: 'eco', label: 'Eco', desc: 'Cheapest. Minimal priority fee.' },
+  { value: 'eco', label: 'Eco', desc: 'Cheapest. 0 priority — base fee only.' },
   { value: 'normal', label: 'Normal', desc: 'Balanced speed and cost.' },
   { value: 'turbo', label: 'Turbo', desc: 'Fastest during congestion.' },
 ];
@@ -245,7 +245,7 @@ export function AboutSection() {
         <SettingRow title="Version">
           <span className="font-mono text-sm text-mist-300">{__APP_VERSION__}</span>
         </SettingRow>
-        <SettingRow title="Chains" desc="Solana (Mainnet, Devnet, Testnet)" />
+        <SettingRow title="Chains" desc="Solana — send & receive · Litecoin — receive" />
         <SettingRow title="Key derivation" desc="BIP-39 · SLIP-0010 ed25519 · m/44'/501'/n'/0'" />
         <SettingRow title="Vault encryption" desc="PBKDF2-SHA256 (600,000 iterations) → AES-256-GCM via WebCrypto" />
         <SettingRow title="Open-source libraries" desc="@solana/web3.js, @solana/spl-token, @scure/bip39, micro-key-producer, React, TanStack Query" />

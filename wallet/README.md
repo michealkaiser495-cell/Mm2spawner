@@ -3,7 +3,8 @@
 A self-custody Solana wallet for the browser. Keys are generated and encrypted on your device
 and never leave it. Every transaction is simulated and inspected before you can sign it.
 
-> **Status: development build.** It starts on **Solana Devnet**. Read [SECURITY.md](./SECURITY.md)
+> **Status: development build.** It defaults to **Solana Mainnet** (real funds). Switch to
+> Devnet in Settings → Network for safe testing. Read [SECURITY.md](./SECURITY.md)
 > before using it with real funds. The code has not had an independent security audit.
 
 ## Features
@@ -15,11 +16,11 @@ and never leave it. Every transaction is simulated and inspected before you can 
 | **Accounts** | Multiple recovery phrases and imported keys, derived accounts, rename, switch, remove |
 | **Dashboard** | Portfolio value, 24H / 7D / 1M / 1Y chart, token holdings, recent activity, token search |
 | **Send** | SOL and SPL / Token-2022 transfers, address validation, fee and rent estimates, simulation, review screen, pending / confirmed / failed states, duplicate-send guard |
-| **Receive** | Address, QR code, copy and share, network selector, wrong-network warnings |
+| **Receive** | Solana address + **Litecoin receive address** (derived from the same phrase, BIP-84/44), QR, copy/share, live LTC balance & history, wrong-network warnings |
 | **Swap** | Live Jupiter quotes, slippage settings, price impact, minimum received, review, confirmation (Mainnet only) |
 | **Explore** | Trending, top and most-traded tokens, search by name, symbol or mint, token detail with chart, market data, audit flags and verification status |
 | **Activity** | Full history with filters, pagination and a detail view (balance changes, fee, programs, Explorer link) |
-| **Settings** | Wallets, security (password, auto-lock, sign-with-password, clipboard clearing), recovery and backup, network and custom RPCs, currency, theme, privacy, about, reset |
+| **Settings** | Wallets, security, recovery/backup, network & custom RPCs, **fee priority (Eco/Normal/Turbo)**, currency, theme, privacy, about, reset |
 
 These are deliberately **not implemented**, and the app says so where they would appear:
 
@@ -58,6 +59,25 @@ The public RPC faucets for devnet and testnet are closed (they return HTTP 410).
 
 The **RPC airdrop** button still works with a custom RPC that runs a faucet, such as a local
 `solana-test-validator`.
+
+### Fees
+
+Nocta charges **no platform fee** on sends or swaps — you pay only Solana's own network cost.
+The fee-priority tier (Settings → Network) controls the optional priority fee:
+
+| Tier | Priority fee | Typical total cost of a transfer |
+| --- | --- | --- |
+| **Eco** (default) | none | ~5,000 lamports base only (~$0.001) |
+| Normal | ~median | slightly higher, lands faster under load |
+| Turbo | ~90th pct | highest, for congestion |
+
+Solana's base fee (5,000 lamports/signature) is fixed by the network and cannot be zero.
+
+### Litecoin
+
+Nocta derives a standard Litecoin receive address (native SegWit `ltc1…` by default, or legacy
+`L…`) from your recovery phrase, so any wallet can send LTC to it. Balance and history come from
+BlockCypher. Sending LTC from Nocta is not implemented yet; the Receive screen says so.
 
 ### Mainnet
 

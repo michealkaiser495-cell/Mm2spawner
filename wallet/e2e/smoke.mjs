@@ -17,6 +17,15 @@ const log = (...a) => console.log('•', ...a);
 const browser = await chromium.launch();
 const ctx = await browser.newContext({ viewport: { width: 1440, height: 960 }, deviceScaleFactor: 1 });
 await ctx.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: BASE });
+// The app now defaults to Mainnet (verified by send-review.mjs). Run this UI walkthrough on
+// Devnet so the public RPC doesn't rate-limit the long click sequence into instability.
+await ctx.addInitScript(() => {
+  try {
+    localStorage.setItem('nocta:settings:v1', JSON.stringify({ state: { network: 'devnet', mainnetAcknowledged: true }, version: 1 }));
+  } catch {
+    /* storage blocked */
+  }
+});
 const page = await ctx.newPage();
 page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
 page.on('console', (m) => {
@@ -53,15 +62,25 @@ await shot('04-dashboard');
 
 const address = await page.evaluate(() => JSON.parse(localStorage.getItem('nocta:meta:v1')).accounts[0].publicKey);
 log('address', address);
-const vaultRaw = await page.evaluate(() => localStorage.getItem('nocta:vault:v1'));
-if (words.some((w) => vaultRaw.includes(w))) throw new Error('plaintext word found in stored vault!');
 const allStorage = await page.evaluate(() => JSON.stringify(localStorage));
-if (allStorage.includes(words.join(' '))) throw new Error('phrase found in localStorage!');
+// A leaked phrase would be stored as space-joined words; base64 ciphertext never contains spaces,
+// so adjacent-word pairs can't collide by chance (unlike single short words, which can).
+const pairs = words.slice(0, -1).map((w, i) => `${w} ${words[i + 1]}`);
+if (allStorage.includes(words.join(' ')) || pairs.some((p) => allStorage.includes(p)))
+  throw new Error('recovery phrase found in storage!');
+// The vault must be well-formed AES-GCM ciphertext (not plaintext JSON of the phrase).
+const vault = await page.evaluate(() => JSON.parse(localStorage.getItem('nocta:vault:v1')));
+if (vault.cipher?.name !== 'AES-GCM' || !vault.data) throw new Error('vault is not encrypted!');
 log('vault encrypted at rest ✓');
 
-// ---- Devnet airdrop (rate limited; tolerate failure)
-await page.getByTestId('airdrop').click();
-await page.waitForTimeout(12_000);
+await page.getByText('Need test SOL?').waitFor({ timeout: 15000 });
+
+// ---- Devnet airdrop (rate limited / faucet may be closed; best-effort only)
+await page
+  .getByTestId('airdrop')
+  .click({ timeout: 10_000 })
+  .then(() => page.waitForTimeout(12_000))
+  .catch((e) => log('airdrop step skipped:', e.message.split('\n')[0]));
 await page.getByRole('button', { name: 'Refresh balances' }).click();
 await page.waitForTimeout(2500);
 const total = (await page.getByTestId('portfolio-total').count()) ? await page.getByTestId('portfolio-total').textContent() : '(RPC unavailable)';
@@ -79,6 +98,14 @@ const visit = async (hash, name, waitFor) => {
 await visit('/receive', '06-receive', 'Your Solana address');
 const shown = await page.getByTestId('receive-address').textContent();
 if (shown !== address) throw new Error('receive address mismatch');
+// Litecoin receive tab: a valid ltc1 address must be derived and shown.
+await page.getByRole('button', { name: /^Litecoin/ }).click();
+await page.getByTestId('ltc-address').waitFor({ timeout: 15000 });
+const ltc = (await page.getByTestId('ltc-address').textContent())?.trim();
+if (!/^ltc1[0-9ac-hj-np-z]{20,}$/.test(ltc)) throw new Error(`invalid LTC address shown: ${ltc}`);
+log('litecoin receive address ✓', ltc);
+await page.waitForTimeout(1500);
+await shot('06b-receive-ltc');
 await visit('/buy', '07-buy', 'Not yet implemented');
 await visit('/send', '08-send', 'Send');
 

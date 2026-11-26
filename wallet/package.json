@@ -21,6 +21,7 @@
     "@radix-ui/react-dropdown-menu": "^2.2.1",
     "@radix-ui/react-switch": "^1.4.1",
     "@radix-ui/react-tooltip": "^1.4.1",
+    "@scure/bip32": "^1.7.0",
     "@scure/bip39": "^2.4.0",
     "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.99.0",

@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { Keypair } from '@solana/web3.js';
 import { decryptVault, encryptVault, encryptWithKey, type EncryptedVault, InvalidPasswordError, isEncryptedVault } from '@/lib/crypto/vault';
 import { encodeSecretKey, isValidMnemonic, keypairFromMnemonic, normalizeMnemonic, parsePrivateKey } from '@/lib/crypto/keys';
+import { deriveLitecoinAddress, type LtcAddressType } from '@/lib/crypto/litecoin';
 import { randomId } from '@/lib/crypto/encoding';
 import { clearSession, getSession, hasSession, setSession, type KeyringSecret, type VaultPayload } from './session';
 
@@ -56,6 +57,7 @@ interface WalletState extends Meta {
   revealSecret: (password: string, keyringId: string) => Promise<KeyringSecret>;
   revealPrivateKey: (password: string, accountId: string) => Promise<string>;
   getKeypair: (accountId: string) => Keypair;
+  getLitecoinAddress: (accountId: string, type?: LtcAddressType) => string | null;
 }
 
 export type NewSecret =
@@ -362,6 +364,19 @@ export const useWallet = create<WalletState>((set, get) => {
       const acct = get().accounts.find((a) => a.id === accountId);
       if (!acct) throw new Error('Account not found');
       return keypairFor(acct);
+    },
+
+    /**
+     * Derive a Litecoin receive address from the active account's keyring. Only available for
+     * recovery-phrase keyrings (imported Solana private keys have no seed), and only unlocked.
+     */
+    getLitecoinAddress(accountId, type = 'segwit') {
+      if (!hasSession()) throw new Error('Wallet is locked');
+      const acct = get().accounts.find((a) => a.id === accountId);
+      if (!acct) return null;
+      const kr = getSession().payload.keyrings.find((k) => k.id === acct.keyringId);
+      if (!kr || kr.type !== 'mnemonic') return null;
+      return deriveLitecoinAddress(kr.mnemonic, type);
     },
   };
 });

@@ -142,7 +142,7 @@ export type SwapFeeLevel = 'eco' | 'normal' | 'turbo';
 // maxLamports is the hard ceiling on the priority fee Jupiter attaches, so a low cap keeps swaps
 // cheap regardless of priorityLevel. (Jupiter's API accepts medium/high/veryHigh, not "low".)
 const SWAP_FEE_TIERS: Record<SwapFeeLevel, { maxLamports: number; priorityLevel: 'medium' | 'high' | 'veryHigh' }> = {
-  eco: { maxLamports: 100_000, priorityLevel: 'medium' }, // ≤0.0001 SOL
+  eco: { maxLamports: 10_000, priorityLevel: 'medium' }, // ≤0.00001 SOL — practically free
   normal: { maxLamports: 1_000_000, priorityLevel: 'medium' }, // ≤0.001 SOL
   turbo: { maxLamports: 5_000_000, priorityLevel: 'high' }, // ≤0.005 SOL
 };

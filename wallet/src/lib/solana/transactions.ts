@@ -62,7 +62,7 @@ export type FeeLevel = 'eco' | 'normal' | 'turbo';
 
 // [percentile of recent fees, hard cap in micro-lamports per compute unit].
 const FEE_TIERS: Record<FeeLevel, { percentile: number; capMicroLamports: number }> = {
-  eco: { percentile: 0.25, capMicroLamports: 20_000 },
+  eco: { percentile: 0, capMicroLamports: 0 }, // 0 priority fee — only Solana's ~5000-lamport base fee
   normal: { percentile: 0.5, capMicroLamports: 200_000 },
   turbo: { percentile: 0.9, capMicroLamports: 2_000_000 },
 };

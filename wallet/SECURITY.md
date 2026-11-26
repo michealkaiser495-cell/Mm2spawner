@@ -5,7 +5,7 @@
 | | |
 | --- | --- |
 | Generation | `@scure/bip39` (audited) draws its randomness from WebCrypto `getRandomValues`. |
-| Derivation | SLIP-0010 ed25519 via `micro-key-producer` (audited, by the author of `@noble`). The path is `m/44'/501'/n'/0'`, checked against the standard test vector (`abandon … about` → `HAgk14Jp…`). |
+| Derivation | Solana: SLIP-0010 ed25519 via `micro-key-producer`, path `m/44'/501'/n'/0'`, checked against the standard vector (`abandon … about` → `HAgk14Jp…`). Litecoin (receive only): secp256k1 BIP-32 via `@scure/bip32`, paths `m/84'/2'/0'/0/i` (SegWit) and `m/44'/2'/0'/0/i` (legacy), checked against canonical BIP-84/44 vectors. No custom cryptography. |
 | Storage | One encrypted vault in `localStorage`, using **PBKDF2-HMAC-SHA256 (600,000 iterations, 16-byte random salt) → AES-256-GCM (random 96-bit IV for every write, with associated data)**. All of this is WebCrypto. Nocta contains no custom cryptography. |
 | In memory | The decrypted vault lives only in a module-scoped variable (`state/session.ts`). It is never in React state and never persisted. The derived AES key is a **non-extractable** `CryptoKey`. A signing keypair is built only for the moment it is needed, and its bytes are wiped afterwards (best effort, because JavaScript cannot guarantee memory zeroisation). |
 | Locking | The wallet locks after a configurable idle time (1 minute to 4 hours), on Lock, and on every page reload. |

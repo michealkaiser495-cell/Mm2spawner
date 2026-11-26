@@ -27,12 +27,22 @@ function hue(str: string) {
   return h;
 }
 
+function LtcLogo({ size }: { size: number }) {
+  return (
+    <span className="grid h-full w-full place-items-center rounded-full font-bold text-white" style={{ background: 'linear-gradient(135deg,#4e5a6b,#2b3340)', fontSize: size * 0.56 }} aria-hidden>
+      Ł
+    </span>
+  );
+}
+
 /** Token logo with graceful fallback. Remote logos load with no referrer. */
 export function TokenIcon({ symbol, icon, mint, size = 40, isNative, className }: { symbol: string; icon?: string; mint?: string; size?: number; isNative?: boolean; className?: string }) {
   const [failed, setFailed] = useState(false);
   const style = { width: size, height: size };
-  if (isNative || symbol === 'SOL' && mint === 'So11111111111111111111111111111111111111112')
+  if (isNative || (symbol === 'SOL' && mint === 'So11111111111111111111111111111111111111112'))
     return <span className={cn('inline-block shrink-0 overflow-hidden rounded-full', className)} style={style}><SolLogo /></span>;
+  if (mint === 'litecoin' || (symbol === 'LTC' && !icon))
+    return <span className={cn('inline-block shrink-0 overflow-hidden rounded-full', className)} style={style}><LtcLogo size={size} /></span>;
   const safeIcon = icon && /^https:\/\//.test(icon) ? icon : undefined;
   if (safeIcon && !failed)
     return (

@@ -35,7 +35,7 @@ export interface Settings {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
-  network: 'devnet', // development starts on testnet
+  network: 'mainnet-beta', // real-world values by default
   rpc: {},
   currency: 'usd',
   autoLockMinutes: 15,
@@ -48,7 +48,7 @@ export const DEFAULT_SETTINGS: Settings = {
   requirePasswordToSign: false,
   fetchMarketData: true,
   testnetReferenceValues: true,
-  mainnetAcknowledged: false,
+  mainnetAcknowledged: true,
   slippageBps: 50,
   feeLevel: 'eco', // cheapest priority fee by default
   clipboardClearSeconds: 60,

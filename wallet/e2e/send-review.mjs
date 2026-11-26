@@ -19,7 +19,17 @@ const fail = (m) => {
 };
 
 const b = await chromium.launch();
-const p = await (await b.newContext({ viewport: { width: 1280, height: 900 } })).newPage();
+const ctx = await b.newContext({ viewport: { width: 1280, height: 900 } });
+// App defaults to Mainnet; this UI test runs on Devnet so the SOL-balance mock pairs with a
+// cluster whose other read calls succeed quickly for the well-known test address.
+await ctx.addInitScript(() => {
+  try {
+    localStorage.setItem('nocta:settings:v1', JSON.stringify({ state: { network: 'devnet', mainnetAcknowledged: true }, version: 1 }));
+  } catch {
+    /* storage blocked */
+  }
+});
+const p = await ctx.newPage();
 const errs = [];
 p.on('pageerror', (e) => errs.push(e.message));
 await p.route('https://api.devnet.solana.com/**', async (route) => {
