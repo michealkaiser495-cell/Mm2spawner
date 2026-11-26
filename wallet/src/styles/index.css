@@ -1,0 +1,171 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-display: 'Space Grotesk Variable', 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-ink-950: #05060a;
+  --color-ink-900: #07080c;
+  --color-ink-850: #0b0d14;
+  --color-ink-800: #10131c;
+  --color-ink-700: #171b27;
+  --color-ink-600: #232838;
+  --color-ink-500: #343a4d;
+  --color-mist-400: #8a90a6;
+  --color-mist-300: #a9aec0;
+  --color-mist-200: #cfd3df;
+  --color-mist-100: #eceef4;
+
+  --color-up: #34d399;
+  --color-down: #fb7185;
+  --color-warn: #fbbf24;
+
+  --color-accent: var(--accent-from);
+  --color-accent-2: var(--accent-to);
+
+  --animate-fade-in: fade-in 0.35s ease-out both;
+  --animate-rise: rise 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  --animate-shimmer: shimmer 1.6s linear infinite;
+  --animate-pulse-ring: pulse-ring 2.2s ease-out infinite;
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px) scale(0.99); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes shimmer {
+    from { background-position: -200% 0; }
+    to { background-position: 200% 0; }
+  }
+  @keyframes pulse-ring {
+    0% { box-shadow: 0 0 0 0 color-mix(in oklab, var(--accent-from) 45%, transparent); }
+    100% { box-shadow: 0 0 0 18px transparent; }
+  }
+}
+
+:root {
+  --accent-from: #3cf0c0;
+  --accent-to: #4f7cff;
+  --surface-bg: #07080c;
+  color-scheme: dark;
+}
+:root[data-surface='oled'] {
+  --surface-bg: #000000;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+body {
+  background: var(--surface-bg);
+  color: var(--color-mist-100);
+  font-family: var(--font-sans);
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Ambient aurora backdrop */
+.aurora-bg {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(60rem 40rem at -10% -20%, color-mix(in oklab, var(--accent-from) 14%, transparent), transparent 60%),
+    radial-gradient(50rem 36rem at 110% 10%, color-mix(in oklab, var(--accent-to) 12%, transparent), transparent 60%),
+    radial-gradient(40rem 30rem at 50% 120%, color-mix(in oklab, var(--accent-to) 8%, transparent), transparent 60%);
+}
+:root[data-surface='oled'] .aurora-bg {
+  opacity: 0.45;
+}
+.grain {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.035;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}
+
+@layer components {
+  .glass {
+    background: linear-gradient(180deg, rgb(255 255 255 / 0.045), rgb(255 255 255 / 0.02));
+    border: 1px solid rgb(255 255 255 / 0.07);
+    backdrop-filter: blur(18px) saturate(140%);
+    -webkit-backdrop-filter: blur(18px) saturate(140%);
+  }
+  .glass-strong {
+    background: linear-gradient(180deg, rgb(22 26 38 / 0.92), rgb(12 14 21 / 0.94));
+    border: 1px solid rgb(255 255 255 / 0.08);
+    backdrop-filter: blur(24px) saturate(150%);
+    -webkit-backdrop-filter: blur(24px) saturate(150%);
+  }
+  .accent-gradient {
+    background-image: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+  }
+  .accent-text {
+    background-image: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .accent-ring {
+    box-shadow:
+      0 0 0 1px color-mix(in oklab, var(--accent-from) 50%, transparent),
+      0 8px 32px -8px color-mix(in oklab, var(--accent-from) 40%, transparent);
+  }
+  .skeleton {
+    background: linear-gradient(90deg, rgb(255 255 255 / 0.04), rgb(255 255 255 / 0.09), rgb(255 255 255 / 0.04));
+    background-size: 200% 100%;
+    animation: var(--animate-shimmer);
+    border-radius: 0.6rem;
+  }
+  .num {
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-none {
+    scrollbar-width: none;
+  }
+}
+
+::selection {
+  background: color-mix(in oklab, var(--accent-from) 35%, transparent);
+}
+@layer base {
+  /* In the base layer so component utilities (e.g. outline-none on wrapped inputs) win. */
+  :focus-visible {
+    outline: 2px solid var(--accent-from);
+    outline-offset: 2px;
+  }
+}
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+}
+
+:root[data-reduce-motion='true'] *,
+:root[data-reduce-motion='true'] *::before,
+:root[data-reduce-motion='true'] *::after {
+  animation-duration: 0.001ms !important;
+  transition-duration: 0.001ms !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

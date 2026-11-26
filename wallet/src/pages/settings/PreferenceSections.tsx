@@ -1,0 +1,261 @@
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
+import { Check, ExternalLink, Loader2, Trash2 } from 'lucide-react';
+import { CURRENCIES } from '@/lib/api/coingecko';
+import { getConnection, isValidRpcUrl, NETWORK_LIST, NETWORKS, type SolanaNetwork } from '@/lib/solana/networks';
+import { friendlyError } from '@/lib/solana/errors';
+import { ACCENTS, useSettings, type AccentId } from '@/state/settings';
+import { useWallet } from '@/state/wallet';
+import { Badge, Button, cn, Input, Notice, Segmented, Switch } from '@/components/ui/primitives';
+import { Modal } from '@/components/ui/Modal';
+import { NetworkDot, useSwitchNetwork } from '@/components/wallet/NetworkSelector';
+import { SettingRow, SettingsCard } from './parts';
+
+// ------------------------------------------------------------------ network
+
+function RpcEditor({ id }: { id: SolanaNetwork }) {
+  const rpc = useSettings((s) => s.rpc);
+  const update = useSettings((s) => s.update);
+  const qc = useQueryClient();
+  const [value, setValue] = useState(rpc[id] ?? '');
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<string>();
+  const valid = !value || isValidRpcUrl(value);
+
+  const test = async (url: string) => {
+    setTesting(true);
+    setResult(undefined);
+    try {
+      const c = getConnection(url);
+      const [v, gh] = await Promise.all([c.getVersion(), c.getGenesisHash()]);
+      const expected: Record<SolanaNetwork, string> = {
+        'mainnet-beta': '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d',
+        devnet: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG',
+        testnet: '4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY',
+      };
+      if (gh !== expected[id]) {
+        setResult(`⚠ This endpoint is NOT ${NETWORKS[id].label} (genesis hash mismatch).`);
+        return false;
+      }
+      setResult(`✓ Connected · Solana ${v['solana-core']}`);
+      return true;
+    } catch (e) {
+      setResult(`✗ ${friendlyError(e)}`);
+      return false;
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="py-4">
+      <div className="mb-2 flex items-center gap-2 font-medium">
+        <NetworkDot network={id} /> {NETWORKS[id].label}
+        {rpc[id] ? <Badge tone="accent">Custom</Badge> : <Badge>Default</Badge>}
+      </div>
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <div className="flex-1">
+          <Input value={value} onChange={(e) => setValue(e.target.value.trim())} placeholder={NETWORKS[id].defaultRpc} aria-label={`${NETWORKS[id].label} RPC URL`} error={!valid ? 'Must be an https:// URL' : undefined} className="font-mono text-xs" />
+        </div>
+        <div className="flex gap-2">
+          <Button onClick={() => test(value || NETWORKS[id].defaultRpc)} disabled={!valid || testing}>
+            {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Test'}
+          </Button>
+          <Button
+            variant="primary"
+            disabled={!valid || testing || value === (rpc[id] ?? '')}
+            onClick={async () => {
+              if (value && !(await test(value))) return;
+              update({ rpc: { ...rpc, [id]: value || undefined } });
+              qc.invalidateQueries();
+              toast.success(value ? 'Custom RPC saved' : 'Reverted to default RPC');
+            }}
+          >
+            Save
+          </Button>
+        </div>
+      </div>
+      {result && <p className={cn('mt-2 text-sm', result.startsWith('✓') ? 'text-up' : 'text-down')}>{result}</p>}
+    </div>
+  );
+}
+
+export function NetworkSection() {
+  const network = useSettings((s) => s.network);
+  const { request, dialog } = useSwitchNetwork();
+  return (
+    <div className="space-y-5">
+      <SettingsCard title="Active network" desc="Testnets use worthless test tokens — ideal for development.">
+        {NETWORK_LIST.map((n) => (
+          <button key={n.id} onClick={() => n.id !== network && request(n.id)} className="flex w-full items-center gap-3 py-4 text-left">
+            <NetworkDot network={n.id} className="h-2.5 w-2.5" />
+            <span className="flex-1">
+              <span className="block font-medium">{n.label}</span>
+              <span className="block text-sm text-mist-400">{n.isTestnet ? 'Test environment' : 'Production · real assets'}</span>
+            </span>
+            {n.id === network && <Check className="h-5 w-5 text-accent" />}
+          </button>
+        ))}
+      </SettingsCard>
+      <SettingsCard title="RPC endpoints" desc="Public endpoints are rate-limited. For reliable Mainnet use, add a dedicated provider URL (Helius, Triton, QuickNode…). Endpoints are verified by genesis hash.">
+        {NETWORK_LIST.map((n) => (
+          <RpcEditor key={n.id} id={n.id} />
+        ))}
+      </SettingsCard>
+      <Notice>Ethereum and other EVM networks are planned. Nocta’s chain layer is modular, so additional networks can be added without touching your keys.</Notice>
+      {dialog}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ display
+
+export function DisplaySection() {
+  const s = useSettings();
+  return (
+    <div className="space-y-5">
+      <SettingsCard title="Currency">
+        <SettingRow title="Display currency" desc="Prices are converted from USD using CoinGecko rates.">
+          <select
+            aria-label="Display currency"
+            value={s.currency}
+            onChange={(e) => s.update({ currency: e.target.value as typeof s.currency })}
+            className="h-10 rounded-xl border border-white/[0.08] bg-ink-850 px-3 text-sm uppercase outline-none focus:border-[var(--accent-from)]"
+          >
+            {CURRENCIES.map((c) => (
+              <option key={c} value={c}>
+                {c.toUpperCase()}
+              </option>
+            ))}
+          </select>
+        </SettingRow>
+      </SettingsCard>
+      <SettingsCard title="Theme">
+        <div className="py-4">
+          <p className="mb-3 font-medium">Accent</p>
+          <div className="flex flex-wrap gap-3">
+            {(Object.keys(ACCENTS) as AccentId[]).map((id) => (
+              <button key={id} onClick={() => s.update({ accent: id })} className="flex flex-col items-center gap-1.5" aria-label={`${ACCENTS[id].label} accent`} aria-pressed={s.accent === id}>
+                <span
+                  className={cn('h-11 w-11 rounded-2xl ring-offset-2 ring-offset-[var(--surface-bg)] transition-all', s.accent === id ? 'ring-2 ring-white/80' : 'ring-0')}
+                  style={{ background: `linear-gradient(135deg, ${ACCENTS[id].from}, ${ACCENTS[id].to})` }}
+                />
+                <span className="text-xs text-mist-400">{ACCENTS[id].label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <SettingRow title="Surface" desc="OLED uses true black to save battery on OLED screens.">
+          <Segmented size="sm" value={s.surface} onChange={(v) => s.update({ surface: v })} options={[{ value: 'dark', label: 'Midnight' }, { value: 'oled', label: 'OLED' }]} />
+        </SettingRow>
+        <SettingRow title="Reduce motion" desc="Minimise animations and transitions.">
+          <Switch label="Reduce motion" checked={s.reduceMotion} onChange={(v) => s.update({ reduceMotion: v })} />
+        </SettingRow>
+        <SettingRow title="Light mode" desc="Nocta is designed dark-first. A light theme is not yet implemented.">
+          <Badge>Not yet available</Badge>
+        </SettingRow>
+      </SettingsCard>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ privacy
+
+export function PrivacySection() {
+  const s = useSettings();
+  return (
+    <div className="space-y-5">
+      <SettingsCard title="Privacy">
+        <SettingRow title="Hide balances" desc="Mask amounts across the app (tap the eye on Home to toggle).">
+          <Switch label="Hide balances" checked={s.hideBalances} onChange={(v) => s.update({ hideBalances: v })} />
+        </SettingRow>
+        <SettingRow title="Hide zero balances" desc="Hide empty token accounts from your token list.">
+          <Switch label="Hide zero balances" checked={s.hideZeroBalances} onChange={(v) => s.update({ hideZeroBalances: v })} />
+        </SettingRow>
+        <SettingRow title="Hide unverified tokens" desc="Hide airdropped/spam tokens Nocta can’t verify.">
+          <Switch label="Hide unverified tokens" checked={s.hideUnverified} onChange={(v) => s.update({ hideUnverified: v })} />
+        </SettingRow>
+        <SettingRow title="Fetch market data" desc="Prices, charts, token metadata & swap quotes from Jupiter and CoinGecko.">
+          <Switch label="Fetch market data" checked={s.fetchMarketData} onChange={(v) => s.update({ fetchMarketData: v })} />
+        </SettingRow>
+        <SettingRow title="Reference values on testnets" desc="Show test SOL valued at the Mainnet SOL price (clearly labelled).">
+          <Switch label="Reference values on testnets" checked={s.testnetReferenceValues} onChange={(v) => s.update({ testnetReferenceValues: v })} />
+        </SettingRow>
+      </SettingsCard>
+      <SettingsCard title="What leaves your device">
+        <div className="space-y-2 py-4 text-sm text-mist-300">
+          <p>
+            <span className="font-semibold text-mist-100">Never:</span> recovery phrases, private keys or your password.
+          </p>
+          <p>
+            <span className="font-semibold text-mist-100">Your RPC provider</span> sees your public address and the transactions you submit — this is inherent to using a blockchain.
+          </p>
+          <p>
+            <span className="font-semibold text-mist-100">Jupiter</span> receives token mint addresses (and your public address only when you request a swap transaction).
+          </p>
+          <p>
+            <span className="font-semibold text-mist-100">CoinGecko</span> receives only generic price-history requests — no addresses.
+          </p>
+          <p>Nocta has no backend, analytics or tracking.</p>
+        </div>
+      </SettingsCard>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ about
+
+export function AboutSection() {
+  const resetAll = useWallet((s) => s.resetAll);
+  const resetSettings = useSettings((s) => s.reset);
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+  return (
+    <div className="space-y-5">
+      <SettingsCard title="Nocta Wallet">
+        <SettingRow title="Version">
+          <span className="font-mono text-sm text-mist-300">{__APP_VERSION__}</span>
+        </SettingRow>
+        <SettingRow title="Chains" desc="Solana (Mainnet, Devnet, Testnet)" />
+        <SettingRow title="Key derivation" desc="BIP-39 · SLIP-0010 ed25519 · m/44'/501'/n'/0'" />
+        <SettingRow title="Vault encryption" desc="PBKDF2-SHA256 (600,000 iterations) → AES-256-GCM via WebCrypto" />
+        <SettingRow title="Open-source libraries" desc="@solana/web3.js, @solana/spl-token, @scure/bip39, micro-key-producer, React, TanStack Query" />
+        <SettingRow title="Solana Explorer">
+          <a href="https://explorer.solana.com" target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-sm text-accent hover:underline">
+            Open <ExternalLink className="h-3.5 w-3.5" />
+          </a>
+        </SettingRow>
+      </SettingsCard>
+      <SettingsCard title="Danger zone">
+        <SettingRow title="Remove wallet from this device" desc="Deletes your encrypted vault and settings. Requires your recovery phrase to restore.">
+          <Button variant="danger" size="sm" onClick={() => setOpen(true)}>
+            <Trash2 className="h-4 w-4" /> Reset
+          </Button>
+        </SettingRow>
+      </SettingsCard>
+      <Modal open={open} onOpenChange={setOpen} title="Remove wallet?">
+        <div className="space-y-4 text-sm">
+          <Notice tone="danger">Without your recovery phrase and private-key backups, your funds will be lost forever.</Notice>
+          <Input label={<>Type <span className="font-mono text-mist-100">RESET</span> to confirm</>} value={text} onChange={(e) => setText(e.target.value)} />
+          <Button
+            variant="danger"
+            block
+            disabled={text !== 'RESET'}
+            onClick={() => {
+              resetAll();
+              resetSettings();
+              qc.clear();
+              navigate('/onboarding', { replace: true });
+            }}
+          >
+            Remove wallet
+          </Button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
