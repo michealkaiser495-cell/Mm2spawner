@@ -12,7 +12,7 @@ import { OnboardingLayout } from './OnboardingLayout';
 export function ImportWallet() {
   const navigate = useNavigate();
   const createVault = useWallet((s) => s.createVault);
-  const discover = useWallet((s) => s.discoverAccounts);
+  const discover = useWallet((s) => s.discoverSolanaSchemes);
   const [secret, setSecret] = useState<NewSecret | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -26,8 +26,10 @@ export function ImportWallet() {
       if (keyrings[0]?.type === 'mnemonic') {
         const s = useSettings.getState();
         const conn = getConnection(rpcUrlFor(s, s.network, NETWORKS[s.network].defaultRpc));
+        // Scan every known Solana derivation path (Phantom, Trust/Ledger, Exodus, …) so the
+        // account that actually holds funds is restored — not a different, empty address.
         const found = await discover(keyrings[0].id, async (pk) => (await conn.getSignaturesForAddress(new PublicKey(pk), { limit: 1 })).length > 0);
-        if (found) toast.success(`Found ${found} additional account${found > 1 ? 's' : ''} with activity`);
+        if (found) toast.success(`Found ${found} funded account${found > 1 ? 's' : ''} across derivation paths`);
       }
       toast.success('Wallet imported');
       navigate('/', { replace: true });

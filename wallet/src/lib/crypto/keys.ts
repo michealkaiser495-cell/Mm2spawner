@@ -19,6 +19,39 @@ export function solanaPath(index: number): string {
   return `m/44'/501'/${index}'/0'`;
 }
 
+/**
+ * Solana derivation schemes. The SAME seed phrase yields DIFFERENT addresses depending on the
+ * path a wallet uses, which is why an Exodus/Ledger/Trust phrase can look like an empty "new"
+ * account when imported with only Phantom's path. All segments are hardened (required by
+ * SLIP-0010 ed25519). On import, Nocta scans these and keeps whichever addresses hold funds.
+ */
+export type SolScheme = 'bip44-0-0' | 'bip44-0' | 'bip44-root';
+
+export interface SolSchemeDef {
+  id: SolScheme;
+  label: string;
+  hint: string;
+  path: (index: number) => string;
+  indexable: boolean; // whether deriving multiple accounts (index > 0) is meaningful
+}
+
+export const SOL_SCHEMES: SolSchemeDef[] = [
+  { id: 'bip44-0-0', label: "m/44'/501'/x'/0'", hint: 'Phantom, Solflare, Backpack, Exodus', path: (i) => `m/44'/501'/${i}'/0'`, indexable: true },
+  { id: 'bip44-0', label: "m/44'/501'/x'", hint: 'Trust Wallet, Ledger Live, Coinbase Wallet', path: (i) => `m/44'/501'/${i}'`, indexable: true },
+  { id: 'bip44-root', label: "m/44'/501'", hint: 'Some legacy wallets', path: () => `m/44'/501'`, indexable: false },
+];
+
+export const DEFAULT_SOL_SCHEME: SolScheme = 'bip44-0-0';
+
+export function solSchemeDef(scheme: SolScheme = DEFAULT_SOL_SCHEME): SolSchemeDef {
+  return SOL_SCHEMES.find((s) => s.id === scheme) ?? SOL_SCHEMES[0];
+}
+
+export function solanaPathFor(scheme: SolScheme, index: number): string {
+  if (!Number.isInteger(index) || index < 0 || index > 0x7fffffff) throw new Error('Invalid account index');
+  return solSchemeDef(scheme).path(index);
+}
+
 export function createMnemonic(words: 12 | 24 = 12): string {
   return generateMnemonic(wordlist, words === 24 ? 256 : 128);
 }
@@ -35,16 +68,16 @@ export function isValidMnemonic(input: string): boolean {
   return validateMnemonic(m, wordlist);
 }
 
-export function keypairFromMnemonic(mnemonic: string, index: number): Keypair {
+export function keypairFromMnemonic(mnemonic: string, index: number, scheme: SolScheme = DEFAULT_SOL_SCHEME): Keypair {
   const seed = mnemonicToSeedSync(normalizeMnemonic(mnemonic));
-  const node = HDKey.fromMasterSeed(seed).derive(solanaPath(index));
+  const node = HDKey.fromMasterSeed(seed).derive(solanaPathFor(scheme, index));
   const kp = Keypair.fromSeed(node.privateKey);
   wipe(seed);
   return kp;
 }
 
-export function publicKeyFromMnemonic(mnemonic: string, index: number): string {
-  return keypairFromMnemonic(mnemonic, index).publicKey.toBase58();
+export function publicKeyFromMnemonic(mnemonic: string, index: number, scheme: SolScheme = DEFAULT_SOL_SCHEME): string {
+  return keypairFromMnemonic(mnemonic, index, scheme).publicKey.toBase58();
 }
 
 /**

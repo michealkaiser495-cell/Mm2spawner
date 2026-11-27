@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type { Keypair } from '@solana/web3.js';
 import { decryptVault, decryptWithKey, encryptVault, encryptWithKey, importVaultKey, type EncryptedVault, InvalidPasswordError, isEncryptedVault } from '@/lib/crypto/vault';
-import { encodeSecretKey, isValidMnemonic, keypairFromMnemonic, normalizeMnemonic, parsePrivateKey } from '@/lib/crypto/keys';
+import { DEFAULT_SOL_SCHEME, encodeSecretKey, isValidMnemonic, keypairFromMnemonic, normalizeMnemonic, parsePrivateKey, SOL_SCHEMES, type SolScheme } from '@/lib/crypto/keys';
 import { type LtcAddressType } from '@/lib/crypto/litecoin';
 import { getExternalChain } from '@/lib/chains/external';
 import { randomId } from '@/lib/crypto/encoding';
@@ -16,6 +16,7 @@ export interface Account {
   name: string;
   keyringId: string;
   index?: number; // derivation index for mnemonic keyrings
+  scheme?: SolScheme; // Solana derivation scheme (default Phantom-style); set for alternate paths
   publicKey: string;
   createdAt: number;
 }
@@ -52,6 +53,7 @@ interface WalletState extends Meta {
   addKeyring: (secret: NewSecret, accountName?: string) => Promise<Account>;
   deriveNextAccount: (keyringId: string, name?: string) => Promise<Account>;
   discoverAccounts: (keyringId: string, hasActivity: (publicKey: string) => Promise<boolean>, maxGap?: number) => Promise<number>;
+  discoverSolanaSchemes: (keyringId: string, hasActivity: (publicKey: string) => Promise<boolean>) => Promise<number>;
   renameAccount: (id: string, name: string) => void;
   removeAccount: (id: string) => Promise<void>;
   setActiveAccount: (id: string) => void;
@@ -140,7 +142,7 @@ function materialise(secret: NewSecret): { keyring: KeyringSecret; firstPublicKe
 function keypairFor(account: Account): Keypair {
   const kr = getSession().payload.keyrings.find((k) => k.id === account.keyringId);
   if (!kr) throw new Error('Key material for this account is missing');
-  if (kr.type === 'mnemonic') return keypairFromMnemonic(kr.mnemonic, account.index ?? 0);
+  if (kr.type === 'mnemonic') return keypairFromMnemonic(kr.mnemonic, account.index ?? 0, account.scheme ?? DEFAULT_SOL_SCHEME);
   return parsePrivateKey(kr.secretKey);
 }
 
@@ -155,11 +157,12 @@ export const useWallet = create<WalletState>((set, get) => {
     writeMeta({ accounts, keyrings, activeAccountId });
   };
 
-  const newAccountMeta = (keyringId: string, publicKey: string, index: number | undefined, name?: string): Account => ({
+  const newAccountMeta = (keyringId: string, publicKey: string, index: number | undefined, name?: string, scheme?: SolScheme): Account => ({
     id: randomId(),
     name: name?.trim() || `Account ${get().accounts.length + 1}`,
     keyringId,
     index,
+    scheme,
     publicKey,
     createdAt: Date.now(),
   });
@@ -327,6 +330,58 @@ export const useWallet = create<WalletState>((set, get) => {
           keyrings: get().keyrings.map((k) => (k.id === keyringId ? { ...k, nextIndex: Math.max(k.nextIndex, i + 1) } : k)),
         });
         added++;
+      }
+      return added;
+    },
+
+    /**
+     * Scan the known Solana derivation schemes (Phantom-style, Trust/Ledger-style, legacy root)
+     * for accounts that hold funds / have on-chain activity, and add any found. This makes a
+     * phrase from Exodus, Ledger, Trust, etc. restore the account that actually has the money,
+     * instead of a different, empty address. The first funded account becomes active.
+     */
+    async discoverSolanaSchemes(keyringId, hasActivity) {
+      const kr = getSession().payload.keyrings.find((k) => k.id === keyringId);
+      if (!kr || kr.type !== 'mnemonic') return 0;
+      let added = 0;
+      let firstFound: Account | null = null;
+      for (const scheme of SOL_SCHEMES) {
+        const maxIndex = scheme.indexable ? 10 : 1;
+        let gap = 0;
+        for (let i = 0; i < maxIndex && gap < 3; i++) {
+          let pk: string;
+          try {
+            pk = keypairFromMnemonic(kr.mnemonic, i, scheme.id).publicKey.toBase58();
+          } catch {
+            break;
+          }
+          let active = false;
+          try {
+            active = await hasActivity(pk);
+          } catch {
+            break; // RPC trouble: stop quietly
+          }
+          if (!active) {
+            gap++;
+            continue;
+          }
+          gap = 0;
+          if (get().accounts.some((a) => a.publicKey === pk)) continue; // already have it
+          const label = scheme.id === DEFAULT_SOL_SCHEME ? undefined : `${scheme.hint.split(',')[0]} path`;
+          const acct = newAccountMeta(keyringId, pk, i, label, scheme.id === DEFAULT_SOL_SCHEME ? undefined : scheme.id);
+          commitMeta({ accounts: [...get().accounts, acct] });
+          firstFound ??= acct;
+          added++;
+        }
+      }
+      // If the default (created) account is empty but a funded one was found, make it active.
+      if (firstFound) {
+        const active = get().accounts.find((a) => a.id === get().activeAccountId);
+        try {
+          if (active && !(await hasActivity(active.publicKey))) commitMeta({ activeAccountId: firstFound.id });
+        } catch {
+          /* leave active as-is */
+        }
       }
       return added;
     },
