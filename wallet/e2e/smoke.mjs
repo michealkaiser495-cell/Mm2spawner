@@ -102,7 +102,7 @@ if (shown !== address) throw new Error('receive address mismatch');
 const externals = [
   ['Bitcoin', /^bc1[0-9ac-hj-np-z]{20,}$/],
   ['Ethereum', /^0x[0-9a-fA-F]{40}$/],
-  ['Litecoin', /^ltc1[0-9ac-hj-np-z]{20,}$/],
+  ['Litecoin', /^L[1-9A-HJ-NP-Za-km-z]{25,39}$/],
   ['Dogecoin', /^D[1-9A-HJ-NP-Za-km-z]{25,39}$/],
 ];
 for (const [name, re] of externals) {

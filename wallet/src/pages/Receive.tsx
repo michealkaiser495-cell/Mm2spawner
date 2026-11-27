@@ -157,6 +157,28 @@ function ExternalReceive({ chain, mode, setMode }: { chain: ExternalChain; mode:
         {balFiat != null && !hide && <p className="text-sm text-mist-300">{formatFiat(balFiat, currency)}</p>}
       </div>
 
+      {chain.kind === 'evm' && (acct.data?.tokens?.length ?? 0) > 0 && (
+        <div className="mb-4 divide-y divide-white/[0.05] rounded-2xl border border-white/[0.06] bg-white/[0.02] px-4">
+          {acct.data!.tokens!.map((t) => {
+            const ui = toNumber(t.balance, t.token.decimals);
+            const tp = prices.data?.[t.token.coingeckoId];
+            return (
+              <div key={t.token.address} className="flex items-center gap-3 py-3">
+                <TokenIcon symbol={t.token.symbol} mint={t.token.address} size={28} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold">{t.token.symbol}</p>
+                  <p className="text-xs text-mist-400">{t.token.name}</p>
+                </div>
+                <div className="text-right">
+                  <p className="num text-sm font-semibold">{hide ? '••••' : formatAmount(ui)}</p>
+                  {tp != null && !hide && <p className="text-xs text-mist-400">{formatFiat(ui * tp, currency)}</p>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       <Qr value={uri} />
       <p className="mt-3 text-center text-xs text-mist-400">Scan to send {chain.symbol} to this wallet</p>
 

@@ -10,6 +10,12 @@ import type { EvmChainParams } from '../crypto/evm';
 import { EVM_CHAINS } from '../crypto/evm';
 import type { UtxoChainParams } from '../crypto/utxo';
 import { UTXO_CHAINS } from '../crypto/utxo';
+import { decodeUint256, encodeBalanceOf, evmTokensFor, type EvmToken } from '../chains/evmTokens';
+
+export interface EvmTokenBalance {
+  token: EvmToken;
+  balance: bigint;
+}
 
 export interface ExternalTx {
   hash: string;
@@ -24,6 +30,7 @@ export interface ExternalAccount {
   unconfirmed: bigint;
   txCount: number;
   txs: ExternalTx[];
+  tokens?: EvmTokenBalance[]; // ERC-20 balances (EVM chains only)
 }
 
 // ---------------------------------------------------------------- UTXO (BlockCypher)
@@ -66,10 +73,28 @@ async function rpc<T>(url: string, method: string, params: unknown[]): Promise<T
   return r.result as T;
 }
 
+/** ERC-20 balances for the chain's known tokens (USDT/USDC/…), via eth_call balanceOf. */
+export async function fetchEvmTokenBalances(chain: EvmChainParams, address: string): Promise<EvmTokenBalance[]> {
+  const tokens = evmTokensFor(chain.id);
+  if (!tokens.length) return [];
+  const results = await Promise.all(
+    tokens.map(async (token) => {
+      try {
+        const hex = await rpc<string>(chain.rpc, 'eth_call', [{ to: token.address, data: encodeBalanceOf(address) }, 'latest']);
+        return { token, balance: decodeUint256(hex) };
+      } catch {
+        return { token, balance: 0n };
+      }
+    }),
+  );
+  return results;
+}
+
 export async function fetchEvmAccount(chain: EvmChainParams, address: string): Promise<ExternalAccount> {
-  const [balHex, nonceHex] = await Promise.all([
+  const [balHex, nonceHex, tokens] = await Promise.all([
     rpc<string>(chain.rpc, 'eth_getBalance', [address, 'latest']),
     rpc<string>(chain.rpc, 'eth_getTransactionCount', [address, 'latest']).catch(() => '0x0'),
+    fetchEvmTokenBalances(chain, address).catch(() => [] as EvmTokenBalance[]),
   ]);
   return {
     address,
@@ -77,6 +102,7 @@ export async function fetchEvmAccount(chain: EvmChainParams, address: string): P
     unconfirmed: 0n,
     txCount: Number(BigInt(nonceHex)),
     txs: [], // full EVM history needs an indexer/API key; the Explorer link covers it.
+    tokens,
   };
 }
 

@@ -3,6 +3,7 @@ import { useQueries, useQuery } from '@tanstack/react-query';
 import { fetchExternalAccount, fetchSimplePrices } from '@/lib/api/external';
 import type { ExternalChain } from '@/lib/chains/external';
 import { EXTERNAL_CHAINS } from '@/lib/chains/external';
+import { allEvmTokenCoingeckoIds, type EvmToken } from '@/lib/chains/evmTokens';
 import { toNumber } from '@/lib/format';
 import { useActiveAccount, useWallet } from '@/state/wallet';
 import { useSettings } from '@/state/settings';
@@ -37,7 +38,7 @@ export function useExternalPrices() {
   const fetchMarketData = useSettings((s) => s.fetchMarketData);
   return useQuery({
     queryKey: ['external-prices'],
-    queryFn: () => fetchSimplePrices(EXTERNAL_CHAINS.map((c) => c.coingeckoId)),
+    queryFn: () => fetchSimplePrices([...EXTERNAL_CHAINS.map((c) => c.coingeckoId), ...allEvmTokenCoingeckoIds()]),
     enabled: fetchMarketData,
     staleTime: 60_000,
     retry: 1,
@@ -53,6 +54,10 @@ export function useExternalVariant(chain: ExternalChain) {
 
 export interface ExternalAsset {
   chain: ExternalChain;
+  token?: EvmToken; // set for an ERC-20 row (USDT/USDC); absent for the native coin
+  symbol: string;
+  name: string;
+  decimals: number;
   address: string | null;
   uiAmount: number;
   priceUsd?: number;
@@ -92,13 +97,16 @@ export function useExternalAssets(): { assets: ExternalAsset[]; totalUsd: number
     })),
   });
 
-  const assets = EXTERNAL_CHAINS.map((c, i) => {
+  const assets = EXTERNAL_CHAINS.flatMap<ExternalAsset>((c, i) => {
     const r = results[i];
     const data = r.data;
     const uiAmount = data ? toNumber(data.balance + data.unconfirmed, c.decimals) : 0;
     const priceUsd = prices.data?.[c.coingeckoId];
-    return {
+    const native: ExternalAsset = {
       chain: c,
+      symbol: c.symbol,
+      name: c.name,
+      decimals: c.decimals,
       address: addresses[i],
       uiAmount,
       priceUsd,
@@ -106,6 +114,27 @@ export function useExternalAssets(): { assets: ExternalAsset[]; totalUsd: number
       isLoading: r.isLoading,
       isError: r.isError,
     };
+    // ERC-20 token rows (USDT/USDC) with a non-zero balance for this chain.
+    const tokenRows: ExternalAsset[] = (data?.tokens ?? [])
+      .filter((t) => t.balance > 0n)
+      .map((t) => {
+        const ui = toNumber(t.balance, t.token.decimals);
+        const tp = prices.data?.[t.token.coingeckoId];
+        return {
+          chain: c,
+          token: t.token,
+          symbol: t.token.symbol,
+          name: `${t.token.name} (${c.name})`,
+          decimals: t.token.decimals,
+          address: addresses[i],
+          uiAmount: ui,
+          priceUsd: tp,
+          valueUsd: tp != null ? ui * tp : undefined,
+          isLoading: r.isLoading,
+          isError: r.isError,
+        };
+      });
+    return [native, ...tokenRows];
   });
   const totalUsd = assets.reduce((s, a) => s + (a.valueUsd ?? 0), 0);
   return { assets, totalUsd };

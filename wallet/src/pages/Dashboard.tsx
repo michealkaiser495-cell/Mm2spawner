@@ -216,11 +216,11 @@ function ExternalAssetRow({ a }: { a: import('@/hooks/useExternalChain').Externa
   const navigate = useNavigate();
   return (
     <button onClick={() => navigate(`/receive?coin=${a.chain.id}`)} className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition-colors hover:bg-white/[0.04]">
-      <TokenIcon symbol={a.chain.symbol} mint={a.chain.id} size={40} />
+      <TokenIcon symbol={a.symbol} mint={a.token ? a.token.address : a.chain.id} size={40} />
       <div className="min-w-0 flex-1">
-        <p className="truncate text-[15px] font-semibold">{a.chain.name}</p>
+        <p className="truncate text-[15px] font-semibold">{a.token ? `${a.symbol} · ${a.chain.name}` : a.chain.name}</p>
         <p className="text-[13px] text-mist-400">
-          {a.isLoading ? '…' : hide ? '••••' : formatAmount(a.uiAmount)} {a.chain.symbol}
+          {a.isLoading ? '…' : hide ? '••••' : formatAmount(a.uiAmount)} {a.symbol}
         </p>
       </div>
       <div className="text-right">
@@ -243,8 +243,8 @@ function Holdings() {
       .filter((a) => !s || a.symbol.toLowerCase().includes(s) || a.name.toLowerCase().includes(s) || a.mint.toLowerCase() === s)
       .map((a) => ({ kind: 'sol', a, key: 'sol:' + a.key, v: a.valueUsd ?? -1 }));
     const external: Row[] = ext.assets
-      .filter((a) => !s || a.chain.symbol.toLowerCase().includes(s) || a.chain.name.toLowerCase().includes(s))
-      .map((a) => ({ kind: 'ext', a, key: 'ext:' + a.chain.id, v: a.valueUsd ?? -1 }));
+      .filter((a) => !s || a.symbol.toLowerCase().includes(s) || a.name.toLowerCase().includes(s) || a.chain.name.toLowerCase().includes(s))
+      .map((a) => ({ kind: 'ext', a, key: 'ext:' + a.chain.id + ':' + (a.token?.address ?? 'native'), v: a.valueUsd ?? -1 }));
     // Sort by USD value desc; ties keep SOL/native first, then registry order.
     return [...sol, ...external].sort((x, y) => y.v - x.v);
   }, [p.assets, ext.assets, q]);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Transaction } from '@scure/btc-signer';
+import { Transaction, p2pkh } from '@scure/btc-signer';
 import { hex } from '@scure/base';
 import { BITCOIN, LITECOIN } from '../crypto/utxo';
 import { buildUtxoTx, deriveUtxoSigner, UTXO_NETWORKS } from './utxoSend';
@@ -9,7 +9,9 @@ const M = 'abandon abandon abandon abandon abandon abandon abandon abandon aband
 describe('UTXO sending (construction + signing)', () => {
   it('derives the correct sender address per chain', () => {
     expect(deriveUtxoSigner(M, BITCOIN).address).toBe('bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu');
-    expect(deriveUtxoSigner(M, LITECOIN).address).toBe('ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh');
+    // Litecoin now uses the legacy (L…) address to match Exodus's default derivation.
+    expect(deriveUtxoSigner(M, LITECOIN).address).toBe('LUWPbpM43E2p7ZSh8cyTBEkvpHmr3cB8Ez');
+    expect(deriveUtxoSigner(M, LITECOIN).type).toBe('legacy');
   });
 
   it('builds a valid signed tx: recipient gets the exact amount, change returns, fee charged', () => {
@@ -48,14 +50,59 @@ describe('UTXO sending (construction + signing)', () => {
     expect(() => buildUtxoTx({ signer, utxos, to: 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq', amount: 500_000n, feePerByte: 5n })).toThrow(/Insufficient/);
   });
 
-  it('uses the right network params for Litecoin', () => {
+  it('uses the right network params + legacy address for Litecoin', () => {
     expect(UTXO_NETWORKS.litecoin.bech32).toBe('ltc');
     expect(UTXO_NETWORKS.litecoin.wif).toBe(0xb0);
     const signer = deriveUtxoSigner(M, LITECOIN);
-    const recipient = deriveUtxoSigner(M, LITECOIN, 1).address; // a real, valid LTC address
-    const plan = buildUtxoTx({ signer, utxos: [{ txid: 'd'.repeat(64), vout: 0, value: 5_000_000n, scriptHex: '' }], to: recipient, amount: 1_000_000n, feePerByte: 2n });
+    // LTC now uses the Exodus-style legacy address (starts with L), not ltc1….
+    expect(signer.type).toBe('legacy');
+    expect(signer.address.startsWith('L')).toBe(true);
+    const recipient = deriveUtxoSigner(M, LITECOIN, 1).address;
+    expect(recipient.startsWith('L')).toBe(true);
+  });
+
+  it('builds and signs a real legacy Litecoin tx from its previous-tx hex', () => {
+    const signer = deriveUtxoSigner(M, LITECOIN);
+    const recipient = deriveUtxoSigner(M, LITECOIN, 1).address;
+    // Construct a real previous transaction whose output[0] pays the signer (legacy inputs are
+    // spent by their full previous tx, which production fetches via fetchPrevTxHex).
+    const pay = p2pkh(signer.publicKey, signer.network);
+    const prev = new Transaction({ allowUnknownInputs: true, allowUnknownOutputs: true });
+    prev.addOutput({ script: pay.script, amount: 5_000_000n });
+    prev.addInput({ txid: hex.decode('e'.repeat(64)), index: 0, finalScriptSig: hex.decode('00') });
+    const prevHex = hex.encode(prev.toBytes(true, false));
+    const prevTxid = prev.id;
+
+    const plan = buildUtxoTx({
+      signer,
+      utxos: [{ txid: prevTxid, vout: 0, value: 5_000_000n, scriptHex: '' }],
+      to: recipient,
+      amount: 1_000_000n,
+      feePerByte: 2n,
+      prevTxHex: { [prevTxid]: prevHex },
+    });
     expect(plan.amount).toBe(1_000_000n);
     expect(plan.change).toBeGreaterThan(0n);
+    expect(plan.fee).toBeGreaterThan(0n);
+    // Re-parse the broadcastable tx: one output is exactly the recipient amount, and
+    // inputs (5,000,000) = outputs + fee (value conservation).
+    const parsed = Transaction.fromRaw(hex.decode(plan.hex), { allowUnknownOutputs: true });
+    let total = 0n;
+    const amounts: bigint[] = [];
+    for (let i = 0; i < parsed.outputsLength; i++) {
+      const o = parsed.getOutput(i)!;
+      total += o.amount!;
+      amounts.push(o.amount!);
+    }
+    expect(amounts).toContain(1_000_000n);
+    expect(total + plan.fee).toBe(5_000_000n);
+  });
+
+  it('requires the previous-tx hex for a legacy input', () => {
+    const signer = deriveUtxoSigner(M, LITECOIN);
+    expect(() =>
+      buildUtxoTx({ signer, utxos: [{ txid: 'd'.repeat(64), vout: 0, value: 5_000_000n, scriptHex: '' }], to: deriveUtxoSigner(M, LITECOIN, 1).address, amount: 1_000_000n, feePerByte: 2n }),
+    ).toThrow(/previous transaction/i);
   });
 });
 

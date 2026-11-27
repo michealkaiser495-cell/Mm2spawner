@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BITCOIN, DOGECOIN, LITECOIN, deriveUtxoAddress, isValidUtxoAddress } from './utxo';
+import { BITCOIN, DOGECOIN, LITECOIN, defaultAddressType, deriveUtxoAddress, isValidUtxoAddress } from './utxo';
 import { deriveEvmAddress, isValidEvmAddress, toChecksumAddress } from './evm';
 
 const M = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
@@ -13,6 +13,14 @@ describe('UTXO derivation (BTC / LTC / DOGE)', () => {
   it('derives the known Litecoin addresses', () => {
     expect(deriveUtxoAddress(M, LITECOIN, { type: 'segwit' })).toBe('ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh');
     expect(deriveUtxoAddress(M, LITECOIN, { type: 'legacy' })).toBe('LUWPbpM43E2p7ZSh8cyTBEkvpHmr3cB8Ez');
+  });
+
+  it('uses one canonical address type per coin (LTC legacy to match Exodus)', () => {
+    expect(defaultAddressType(BITCOIN)).toBe('segwit');
+    expect(defaultAddressType(LITECOIN)).toBe('legacy'); // L… address, not ltc1…
+    expect(defaultAddressType(DOGECOIN)).toBe('legacy');
+    // The address Nocta actually shows/derives by default for LTC is the L… one.
+    expect(deriveUtxoAddress(M, LITECOIN)).toBe('LUWPbpM43E2p7ZSh8cyTBEkvpHmr3cB8Ez');
   });
 
   it('derives a legacy Dogecoin address (D-prefixed) and falls back from segwit', () => {

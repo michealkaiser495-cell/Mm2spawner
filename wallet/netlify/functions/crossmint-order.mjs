@@ -59,7 +59,15 @@ export const handler = async (event) => {
       }),
     });
     const data = await res.json();
-    if (data.error) return json({ error: data.message || 'Crossmint rejected the order.' }, 400);
+    if (data.error) {
+      const msg = String(data.message || '');
+      // The key is valid but lacks the on-ramp scope — a dashboard setting, not a code bug.
+      if (res.status === 403 || /scopes|orders\.create/i.test(msg)) {
+        return json({ error: 'This Crossmint key cannot create card purchases yet. In your Crossmint dashboard, enable the on-ramp / "orders.create" scope for this key (production on-ramp needs Crossmint business verification).', code: 'missing_scope' }, 403);
+      }
+      if (/unsupported token/i.test(msg)) return json({ error: 'Crossmint does not sell that token. USDC is supported.', code: 'unsupported_token' }, 400);
+      return json({ error: msg || 'Crossmint rejected the order.' }, 400);
+    }
 
     const order = data.order || data;
     const clientSecret = data.clientSecret || order.clientSecret;

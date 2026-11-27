@@ -35,7 +35,9 @@ function utxoChain(coin: UtxoChainParams): ExternalChain {
     decimals: 8,
     coingeckoId: coin.coingeckoId,
     uriScheme: coin.id,
-    variants: coin.bech32Hrp ? [{ id: 'segwit', label: `SegWit (${coin.bech32Hrp}1)` }, { id: 'legacy', label: 'Legacy' }] : undefined,
+    // One canonical address per coin (no picker). The coin's defaultType decides the format:
+    // BTC → SegWit (bc1…), LTC → legacy (L…, matches Exodus), DOGE → legacy (D…).
+    variants: undefined,
     deriveAddress: (m, variant, index) => deriveUtxoAddress(m, coin, { type: (variant as UtxoAddressType) ?? defaultAddressType(coin), index }),
     isValidAddress: (a) => isValidUtxoAddress(coin, a),
     explorerAddress: (a) => utxoExplorerAddressUrl(coin, a),

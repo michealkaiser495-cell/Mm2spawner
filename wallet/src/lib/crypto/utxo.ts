@@ -27,16 +27,23 @@ export interface UtxoChainParams {
   p2pkhVersion: number; // legacy address version byte
   coingeckoId: string;
   blockcypherChain: string; // path segment in api.blockcypher.com/v1/<chain>/main
+  /**
+   * The single address type Nocta derives and shows for this coin. One address per coin — no
+   * picker. Bitcoin uses modern SegWit (bc1…, cheapest fees). Litecoin uses legacy (L…) to match
+   * Exodus's default (BIP-44 m/44'/2'/0'/0/i), so the address reconciles with an Exodus wallet.
+   * Dogecoin has only legacy.
+   */
+  defaultType: UtxoAddressType;
 }
 
 export const BITCOIN: UtxoChainParams = {
-  id: 'bitcoin', name: 'Bitcoin', symbol: 'BTC', coinType: 0, bech32Hrp: 'bc', p2pkhVersion: 0x00, coingeckoId: 'bitcoin', blockcypherChain: 'btc',
+  id: 'bitcoin', name: 'Bitcoin', symbol: 'BTC', coinType: 0, bech32Hrp: 'bc', p2pkhVersion: 0x00, coingeckoId: 'bitcoin', blockcypherChain: 'btc', defaultType: 'segwit',
 };
 export const LITECOIN: UtxoChainParams = {
-  id: 'litecoin', name: 'Litecoin', symbol: 'LTC', coinType: 2, bech32Hrp: 'ltc', p2pkhVersion: 0x30, coingeckoId: 'litecoin', blockcypherChain: 'ltc',
+  id: 'litecoin', name: 'Litecoin', symbol: 'LTC', coinType: 2, bech32Hrp: 'ltc', p2pkhVersion: 0x30, coingeckoId: 'litecoin', blockcypherChain: 'ltc', defaultType: 'legacy',
 };
 export const DOGECOIN: UtxoChainParams = {
-  id: 'dogecoin', name: 'Dogecoin', symbol: 'DOGE', coinType: 3, bech32Hrp: null, p2pkhVersion: 0x1e, coingeckoId: 'dogecoin', blockcypherChain: 'doge',
+  id: 'dogecoin', name: 'Dogecoin', symbol: 'DOGE', coinType: 3, bech32Hrp: null, p2pkhVersion: 0x1e, coingeckoId: 'dogecoin', blockcypherChain: 'doge', defaultType: 'legacy',
 };
 
 export const UTXO_CHAINS: Record<string, UtxoChainParams> = { bitcoin: BITCOIN, litecoin: LITECOIN, dogecoin: DOGECOIN };
@@ -64,7 +71,7 @@ function pathFor(type: UtxoAddressType, coinType: number, index: number): string
 }
 
 export function deriveUtxoAddress(mnemonic: string, coin: UtxoChainParams, opts: { type?: UtxoAddressType; index?: number } = {}): string {
-  let { type = 'segwit' } = opts;
+  let type = opts.type ?? defaultAddressType(coin); // the coin's one canonical type unless overridden
   const index = opts.index ?? 0;
   if (type === 'segwit' && !coin.bech32Hrp) type = 'legacy'; // chain has no SegWit (e.g. Dogecoin)
   const seed = mnemonicToSeedSync(normalizeMnemonic(mnemonic));
@@ -76,7 +83,9 @@ export function deriveUtxoAddress(mnemonic: string, coin: UtxoChainParams, opts:
 }
 
 export function defaultAddressType(coin: UtxoChainParams): UtxoAddressType {
-  return coin.bech32Hrp ? 'segwit' : 'legacy';
+  // Honour the coin's chosen single type, but never return segwit for a chain without it.
+  if (coin.defaultType === 'segwit' && !coin.bech32Hrp) return 'legacy';
+  return coin.defaultType;
 }
 
 export function isValidUtxoAddress(coin: UtxoChainParams, addr: string): boolean {
