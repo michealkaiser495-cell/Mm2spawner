@@ -1,0 +1,10 @@
+# Netlify config for deploying Nocta (static build + the Crossmint order function).
+# Deploy by connecting this GitHub repo to Netlify (not drag-and-drop), with base = wallet.
+[build]
+  base = "wallet"
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
