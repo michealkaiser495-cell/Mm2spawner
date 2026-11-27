@@ -12,6 +12,7 @@ import { useSettings } from '@/state/settings';
 import { useActiveAccount } from '@/state/wallet';
 import { PageHeader } from '@/components/layout/AppShell';
 import { Button, Card, cn, EmptyState, Notice, Segmented, Skeleton } from '@/components/ui/primitives';
+import { ExternalSend } from '@/components/wallet/ExternalSend';
 import { LogoMark } from '@/components/ui/Logo';
 import { TokenIcon } from '@/components/ui/TokenIcon';
 import { NetworkDot, useSwitchNetwork } from '@/components/wallet/NetworkSelector';
@@ -93,7 +94,7 @@ function SolanaReceive() {
   );
 }
 
-function ExternalReceive({ chain }: { chain: ExternalChain }) {
+function ExternalReceive({ chain, mode, setMode }: { chain: ExternalChain; mode: 'receive' | 'send'; setMode: (m: 'receive' | 'send') => void }) {
   const [variant, setVariant] = useExternalVariant(chain);
   const address = useExternalAddress(chain, variant);
   const acct = useExternalAccount(chain, address);
@@ -113,8 +114,20 @@ function ExternalReceive({ chain }: { chain: ExternalChain }) {
   const balFiat = bal != null && price != null ? bal * price : undefined;
   const uri = chain.kind === 'evm' ? address : `${chain.uriScheme}:${address}`;
 
+  const toggle = (
+    <Segmented className="mb-4 w-full [&>button]:flex-1" value={mode} onChange={setMode} options={[{ value: 'receive', label: 'Receive' }, { value: 'send', label: 'Send' }]} />
+  );
+  if (mode === 'send')
+    return (
+      <>
+        {toggle}
+        <ExternalSend chain={chain} address={address} />
+      </>
+    );
+
   return (
     <>
+      {toggle}
       <div className="mb-4 flex items-center justify-between gap-3">
         {chain.variants ? (
           <Segmented size="sm" value={variant ?? chain.variants[0].id} onChange={setVariant} options={chain.variants.map((v) => ({ value: v.id, label: v.label }))} />
@@ -198,20 +211,21 @@ function ExternalReceive({ chain }: { chain: ExternalChain }) {
 export function Receive() {
   const account = useActiveAccount();
   const [chainId, setChainId] = useState('solana');
+  const [mode, setMode] = useState<'receive' | 'send'>('receive');
   const tabs = useMemo(() => [{ id: 'solana', name: 'Solana', symbol: 'SOL' }, ...EXTERNAL_CHAINS], []);
   if (!account) return null;
   const external = EXTERNAL_CHAINS.find((c) => c.id === chainId);
 
   return (
     <div className="mx-auto max-w-lg">
-      <PageHeader title="Receive" subtitle={account.name} back="/" />
+      <PageHeader title={external && mode === 'send' ? `Send ${external.symbol}` : 'Receive'} subtitle={account.name} back="/" />
       <Card className="p-5 sm:p-6">
         <span className="mb-2 block text-sm font-medium text-mist-300">Choose a coin</span>
         <div className="scrollbar-none -mx-1 mb-4 flex gap-2 overflow-x-auto px-1">
           {tabs.map((c) => (
             <button
               key={c.id}
-              onClick={() => setChainId(c.id)}
+              onClick={() => { setChainId(c.id); setMode('receive'); }}
               className={cn('flex shrink-0 items-center gap-1.5 rounded-xl border px-3 py-2 text-sm font-medium transition-colors', chainId === c.id ? 'accent-ring border-transparent bg-white/[0.08]' : 'border-white/[0.07] bg-white/[0.03] text-mist-300 hover:bg-white/[0.06]')}
             >
               <TokenIcon symbol={c.symbol} mint={c.id === 'solana' ? 'So11111111111111111111111111111111111111112' : c.id} isNative={c.id === 'solana'} size={18} />
@@ -219,7 +233,7 @@ export function Receive() {
             </button>
           ))}
         </div>
-        {external ? <ExternalReceive chain={external} /> : <SolanaReceive />}
+        {external ? <ExternalReceive chain={external} mode={mode} setMode={setMode} /> : <SolanaReceive />}
       </Card>
     </div>
   );

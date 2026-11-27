@@ -59,6 +59,7 @@ interface WalletState extends Meta {
   revealPrivateKey: (password: string, accountId: string) => Promise<string>;
   getKeypair: (accountId: string) => Keypair;
   getExternalAddress: (accountId: string, chainId: string, variant?: string) => string | null;
+  getMnemonicForAccount: (accountId: string) => { mnemonic: string; index: number } | null;
   getLitecoinAddress: (accountId: string, type?: LtcAddressType) => string | null;
 }
 
@@ -386,6 +387,16 @@ export const useWallet = create<WalletState>((set, get) => {
 
     getLitecoinAddress(accountId, type = 'segwit') {
       return get().getExternalAddress(accountId, 'litecoin', type);
+    },
+
+    /** The recovery phrase + account index for signing external-chain transactions (unlocked only). */
+    getMnemonicForAccount(accountId) {
+      if (!hasSession()) throw new Error('Wallet is locked');
+      const acct = get().accounts.find((a) => a.id === accountId);
+      if (!acct) return null;
+      const kr = getSession().payload.keyrings.find((k) => k.id === acct.keyringId);
+      if (!kr || kr.type !== 'mnemonic') return null;
+      return { mnemonic: kr.mnemonic, index: acct.index ?? 0 };
     },
   };
 });

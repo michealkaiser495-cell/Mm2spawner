@@ -98,3 +98,41 @@ export async function fetchSimplePrices(coingeckoIds: string[], vs = 'usd'): Pro
   for (const [id, m] of Object.entries(d)) if (typeof m[vs] === 'number') out[id] = m[vs];
   return out;
 }
+
+// ---------------------------------------------------------------- UTXO send support (BlockCypher)
+
+import type { Utxo } from '../chains/utxoSend';
+
+interface BcUnspent {
+  txrefs?: { tx_hash: string; tx_output_n: number; value: number; script?: string }[];
+  unconfirmed_txrefs?: { tx_hash: string; tx_output_n: number; value: number; script?: string }[];
+}
+
+/** Confirmed unspent outputs for a UTXO address (with their scripts). */
+export async function fetchUtxos(coin: UtxoChainParams, address: string): Promise<Utxo[]> {
+  const d = await getJson<BcUnspent>(`https://api.blockcypher.com/v1/${coin.blockcypherChain}/main/addrs/${encodeURIComponent(address)}?unspentOnly=true&includeScript=true&limit=50`);
+  return (d.txrefs ?? []).map((r) => ({ txid: r.tx_hash, vout: r.tx_output_n, value: BigInt(r.value), scriptHex: r.script ?? '' }));
+}
+
+/** Raw hex of a previous transaction (needed to sign legacy / non-SegWit inputs). */
+export async function fetchPrevTxHex(coin: UtxoChainParams, txid: string): Promise<string> {
+  const d = await getJson<{ hex: string }>(`https://api.blockcypher.com/v1/${coin.blockcypherChain}/main/txs/${encodeURIComponent(txid)}?includeHex=true&limit=1`);
+  return d.hex;
+}
+
+/** Cheapest reasonable fee rate (sat/vByte), from the chain's low-priority estimate. */
+export async function fetchUtxoFeeRate(coin: UtxoChainParams): Promise<bigint> {
+  const d = await getJson<{ low_fee_per_kb: number }>(`https://api.blockcypher.com/v1/${coin.blockcypherChain}/main`);
+  const perByte = Math.floor((d.low_fee_per_kb ?? 1000) / 1000);
+  return BigInt(Math.max(1, perByte)); // floor of 1 sat/vByte
+}
+
+/** Broadcast a signed raw transaction. Returns the txid. */
+export async function broadcastUtxoTx(coin: UtxoChainParams, txHex: string): Promise<string> {
+  const d = await getJson<{ tx?: { hash: string }; error?: string }>(`https://api.blockcypher.com/v1/${coin.blockcypherChain}/main/txs/push`, {
+    method: 'POST',
+    body: JSON.stringify({ tx: txHex }),
+  });
+  if (!d.tx?.hash) throw new Error(d.error || 'Broadcast failed');
+  return d.tx.hash;
+}
