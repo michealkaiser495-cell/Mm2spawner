@@ -17,7 +17,7 @@ export const NETWORKS: Record<SolanaNetwork, NetworkConfig> = {
     id: 'mainnet-beta',
     label: 'Solana Mainnet',
     short: 'Mainnet',
-    defaultRpc: 'https://api.mainnet-beta.solana.com',
+    defaultRpc: 'https://solana-rpc.publicnode.com',
     isTestnet: false,
     hasMarketData: true,
   },

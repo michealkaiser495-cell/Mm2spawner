@@ -9,7 +9,7 @@ const { chromium } = require('playwright');
 
 const BASE = process.argv[2] ?? 'http://localhost:4173';
 const OUT = process.argv[3] ?? 'e2e/screens';
-const PW = 'Nocta-Test-Passw0rd!';
+const PW = '112940';
 const PHRASE = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
 mkdirSync(OUT, { recursive: true });
 
@@ -43,8 +43,8 @@ await p.goto(BASE);
 await p.getByRole('button', { name: 'I already have a wallet' }).click();
 await p.getByLabel('Recovery phrase').fill(PHRASE);
 await p.getByRole('button', { name: 'Continue' }).click();
-await p.getByLabel('New password').fill(PW);
-await p.getByLabel('Confirm password').fill(PW);
+await p.getByLabel('Create a passcode').fill(PW);
+await p.getByLabel('Confirm passcode').fill(PW);
 await p.getByRole('checkbox').check();
 await p.getByRole('button', { name: 'Import wallet' }).click();
 await p.getByText('Recent activity').waitFor();

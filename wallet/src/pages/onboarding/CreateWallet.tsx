@@ -53,8 +53,8 @@ export function CreateWallet() {
       <Steps step={idx} total={3} />
       {step === 'password' && (
         <div className="mt-5">
-          <h2 className="font-display text-2xl font-bold">Create a password</h2>
-          <p className="mb-6 mt-1 text-sm text-mist-400">Encrypts your wallet on this device (PBKDF2 · AES-256-GCM).</p>
+          <h2 className="font-display text-2xl font-bold">Create a passcode</h2>
+          <p className="mb-6 mt-1 text-sm text-mist-400">A number you’ll enter to unlock Nocta. Encrypts your wallet on this device (PBKDF2 · AES-256-GCM).</p>
           <PasswordSetup
             onSubmit={(pw) => {
               setPassword(pw);

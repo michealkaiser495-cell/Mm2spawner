@@ -9,7 +9,7 @@ import { mkdirSync } from 'node:fs';
 const BASE = process.argv[2] ?? 'http://localhost:4173';
 const OUT = process.argv[3] ?? 'e2e/screens';
 mkdirSync(OUT, { recursive: true });
-const PASSWORD = 'Nocta-Test-Passw0rd!';
+const PASSWORD = '112940'; // numeric passcode
 
 const errors = [];
 const log = (...a) => console.log('•', ...a);
@@ -36,8 +36,8 @@ const shot = (name) => page.screenshot({ path: `${OUT}/${name}.png` });
 // ---- Onboarding: create wallet
 await page.goto(BASE);
 await page.getByRole('button', { name: 'Create a new wallet' }).click();
-await page.getByLabel('New password').fill(PASSWORD);
-await page.getByLabel('Confirm password').fill(PASSWORD);
+await page.getByLabel('Create a passcode').fill(PASSWORD);
+await page.getByLabel('Confirm passcode').fill(PASSWORD);
 await page.getByRole('checkbox').check();
 await shot('01-password');
 await page.getByRole('button', { name: 'Continue' }).click();
@@ -154,11 +154,11 @@ log('derived account 2 ✓');
 await page.goto(`${BASE}/#/settings/security`);
 await page.getByRole('button', { name: 'Lock', exact: true }).click();
 await page.waitForURL(/unlock/);
-await page.getByLabel('Password', { exact: true }).fill('wrong-password');
+await page.getByLabel('Passcode', { exact: true }).fill('999999');
 await page.getByRole('button', { name: 'Unlock' }).click();
 await page.getByText('Incorrect password').waitFor();
 await shot('15-unlock-error');
-await page.getByLabel('Password', { exact: true }).fill(PASSWORD);
+await page.getByLabel('Passcode', { exact: true }).fill(PASSWORD);
 await page.getByRole('button', { name: 'Unlock' }).click();
 // Unlock returns you to the screen you locked from.
 await page.waitForURL((u) => !u.hash.includes('unlock'));
@@ -169,7 +169,7 @@ log('lock/unlock ✓ (returned to', new URL(page.url()).hash + ')');
 await page.reload();
 await page.waitForURL(/unlock/);
 log('reload locks wallet ✓');
-await page.getByLabel('Password', { exact: true }).fill(PASSWORD);
+await page.getByLabel('Passcode', { exact: true }).fill(PASSWORD);
 await page.getByRole('button', { name: 'Unlock' }).click();
 await page.waitForURL((u) => !u.hash.includes('unlock'));
 

@@ -3,30 +3,49 @@ import { Check, Eye, EyeOff, ShieldCheck } from 'lucide-react';
 import { useClipboard } from '@/hooks/useClipboard';
 import { Button, cn, Input } from '../ui/primitives';
 
-// ------------------------------------------------------------------ password strength
-export function passwordScore(pw: string): { score: 0 | 1 | 2 | 3 | 4; label: string } {
-  let s = 0;
-  if (pw.length >= 8) s++;
-  if (pw.length >= 12) s++;
-  if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) s++;
-  if (/\d/.test(pw) && /[^A-Za-z0-9]/.test(pw)) s++;
-  if (pw.length >= 16) s = Math.min(4, s + 1);
-  if (/^(.)\1+$/.test(pw) || ['password', '12345678', 'qwertyui'].some((w) => pw.toLowerCase().includes(w))) s = 0;
-  const labels = ['Too weak', 'Weak', 'Fair', 'Good', 'Strong'];
-  return { score: s as 0 | 1 | 2 | 3 | 4, label: labels[s] };
+// ------------------------------------------------------------------ passcode strength
+const COMMON_PINS = new Set(['1234', '0000', '1111', '4321', '2580', '1212', '123456', '000000', '111111', '654321', '121212', '112233']);
+function isSequential(pw: string): boolean {
+  if (pw.length < 4) return false;
+  let up = true;
+  let down = true;
+  for (let i = 1; i < pw.length; i++) {
+    if (pw.charCodeAt(i) - pw.charCodeAt(i - 1) !== 1) up = false;
+    if (pw.charCodeAt(i - 1) - pw.charCodeAt(i) !== 1) down = false;
+  }
+  return up || down;
 }
 
-export const MIN_PASSWORD = 8;
+/** Passcode strength (digits only). A short/common PIN scores low but is still allowed. */
+export function passwordScore(pw: string): { score: 0 | 1 | 2 | 3 | 4; label: string } {
+  if (!pw) return { score: 0, label: '' };
+  if (/^(\d)\1+$/.test(pw) || COMMON_PINS.has(pw) || isSequential(pw)) return { score: 1, label: 'Weak' };
+  let s = 0;
+  if (pw.length >= 4) s++;
+  if (pw.length >= 6) s++;
+  if (pw.length >= 8) s++;
+  if (pw.length >= 10) s++;
+  const labels = ['Too short', 'Weak', 'Fair', 'Good', 'Strong'];
+  const score = Math.min(4, s);
+  return { score: score as 0 | 1 | 2 | 3 | 4, label: labels[score] };
+}
 
+export const MIN_PASSWORD = 4; // minimum passcode length
+
+const onlyDigits = (v: string) => v.replace(/\D/g, '').slice(0, 12);
+
+/** Numeric passcode input (shows a number keypad on phones). */
 export function PasswordInput(props: React.ComponentProps<typeof Input>) {
   const [show, setShow] = useState(false);
   return (
     <Input
       {...props}
       type={show ? 'text' : 'password'}
-      autoComplete={props.autoComplete ?? 'current-password'}
+      inputMode="numeric"
+      pattern="[0-9]*"
+      autoComplete="off"
       right={
-        <button type="button" onClick={() => setShow((s) => !s)} className="rounded-lg p-2 text-mist-400 hover:text-mist-100" aria-label={show ? 'Hide password' : 'Show password'}>
+        <button type="button" onClick={() => setShow((s) => !s)} className="rounded-lg p-2 text-mist-400 hover:text-mist-100" aria-label={show ? 'Hide passcode' : 'Show passcode'}>
           {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
         </button>
       }
@@ -40,7 +59,7 @@ export function PasswordSetup({ onSubmit, submitLabel = 'Continue', loading }: {
   const [agree, setAgree] = useState(false);
   const { score, label } = passwordScore(pw);
   const mismatch = confirm.length > 0 && pw !== confirm;
-  const valid = pw.length >= MIN_PASSWORD && score >= 2 && pw === confirm && agree;
+  const valid = pw.length >= MIN_PASSWORD && pw === confirm && agree;
 
   return (
     <form
@@ -51,31 +70,27 @@ export function PasswordSetup({ onSubmit, submitLabel = 'Continue', loading }: {
       }}
     >
       <div>
-        <PasswordInput label="New password" value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="new-password" placeholder={`At least ${MIN_PASSWORD} characters`} autoFocus />
+        <PasswordInput label="Create a passcode" value={pw} onChange={(e) => setPw(onlyDigits(e.target.value))} placeholder="At least 4 digits" autoFocus />
         <div className="mt-2 flex items-center gap-2">
           <div className="flex flex-1 gap-1">
             {[0, 1, 2, 3].map((i) => (
-              <span
-                key={i}
-                className={cn(
-                  'h-1 flex-1 rounded-full transition-colors',
-                  pw && i < score ? (score <= 1 ? 'bg-down' : score === 2 ? 'bg-warn' : 'bg-up') : 'bg-white/10',
-                )}
-              />
+              <span key={i} className={cn('h-1 flex-1 rounded-full transition-colors', pw && i < score ? (score <= 1 ? 'bg-down' : score === 2 ? 'bg-warn' : 'bg-up') : 'bg-white/10')} />
             ))}
           </div>
-          <span className="w-16 text-right text-xs text-mist-400">{pw ? label : ''}</span>
+          <span className="w-16 text-right text-xs text-mist-400">{label}</span>
         </div>
       </div>
-      <PasswordInput label="Confirm password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" error={mismatch ? 'Passwords do not match' : undefined} />
+      <PasswordInput label="Confirm passcode" value={confirm} onChange={(e) => setConfirm(onlyDigits(e.target.value))} error={mismatch ? 'Passcodes do not match' : undefined} />
+      {pw.length >= MIN_PASSWORD && score <= 1 && (
+        <p className="text-xs text-warn">A longer passcode (6+ digits, not a pattern like 1234) is much harder to guess. Use what you like, but longer is safer.</p>
+      )}
       <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] p-3 text-sm text-mist-300">
         <input type="checkbox" checked={agree} onChange={(e) => setAgree(e.target.checked)} className="mt-0.5 h-4 w-4 accent-[var(--accent-from)]" />
-        <span>I understand this password unlocks Nocta on this device only. It cannot be recovered — my recovery phrase is the only backup.</span>
+        <span>I understand this passcode unlocks Nocta on this device only. It cannot be recovered — my recovery phrase is the only backup.</span>
       </label>
       <Button type="submit" variant="primary" size="lg" block disabled={!valid} loading={loading}>
         {submitLabel}
       </Button>
-      {pw.length > 0 && score < 2 && <p className="text-center text-xs text-mist-400">Use 12+ characters with a mix of letters, numbers and symbols.</p>}
     </form>
   );
 }

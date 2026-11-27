@@ -8,7 +8,7 @@ import { AboutSection, BuySection, DisplaySection, NetworkSection, PrivacySectio
 
 const SECTIONS = [
   { id: 'wallets', label: 'Wallets & accounts', desc: 'Create, import, rename, switch', icon: Users, el: <WalletsSection /> },
-  { id: 'security', label: 'Security', desc: 'Password, auto-lock, signing', icon: Lock, el: <SecuritySection /> },
+  { id: 'security', label: 'Security', desc: 'Passcode, auto-lock, signing', icon: Lock, el: <SecuritySection /> },
   { id: 'backup', label: 'Recovery & backup', desc: 'Recovery phrase, private keys', icon: KeyRound, el: <BackupSection /> },
   { id: 'network', label: 'Network', desc: 'Cluster & RPC endpoints', icon: Globe, el: <NetworkSection /> },
   { id: 'buy', label: 'Buy with card', desc: 'Crossmint on-ramp key', icon: CreditCard, el: <BuySection /> },

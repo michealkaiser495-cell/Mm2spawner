@@ -8,7 +8,7 @@ import { PasswordInput } from './SetupParts';
 export function PasswordPrompt({
   open,
   onOpenChange,
-  title = 'Confirm with password',
+  title = 'Confirm with passcode',
   description,
   confirmLabel = 'Confirm',
   onConfirm,
@@ -43,7 +43,7 @@ export function PasswordPrompt({
           setError(undefined);
           try {
             if (!(await verify(pw))) {
-              setError('Incorrect password');
+              setError('Incorrect passcode');
               return;
             }
             const p = pw;

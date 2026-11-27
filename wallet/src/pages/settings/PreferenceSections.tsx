@@ -213,7 +213,7 @@ export function PrivacySection() {
       <SettingsCard title="What leaves your device">
         <div className="space-y-2 py-4 text-sm text-mist-300">
           <p>
-            <span className="font-semibold text-mist-100">Never:</span> recovery phrases, private keys or your password.
+            <span className="font-semibold text-mist-100">Never:</span> recovery phrases, private keys or your passcode.
           </p>
           <p>
             <span className="font-semibold text-mist-100">Your RPC provider</span> sees your public address and the transactions you submit — this is inherent to using a blockchain.

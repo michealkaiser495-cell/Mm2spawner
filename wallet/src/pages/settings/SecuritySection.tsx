@@ -39,7 +39,7 @@ export function SecuritySection() {
   return (
     <div className="space-y-5">
       <SettingsCard title="Security">
-        <SettingRow title="Password" desc="Re-encrypts your vault with a fresh salt and key.">
+        <SettingRow title="Passcode" desc="Re-encrypts your vault with a fresh salt and key.">
           <Button size="sm" onClick={() => setPwOpen(true)}>
             Change
           </Button>
@@ -53,7 +53,7 @@ export function SecuritySection() {
             ))}
           </select>
         </SettingRow>
-        <SettingRow title="Require password to sign" desc="Ask for your password before every transaction.">
+        <SettingRow title="Require passcode to sign" desc="Ask for your passcode before every transaction.">
           <Switch label="Require password to sign" checked={s.requirePasswordToSign} onChange={(v) => s.update({ requirePasswordToSign: v })} />
         </SettingRow>
         <SettingRow title="Clear clipboard" desc="Wipe copied secrets after this delay.">
@@ -94,7 +94,7 @@ export function SecuritySection() {
         ))}
       </SettingsCard>
 
-      <Modal open={pwOpen} onOpenChange={(v) => !v && closePw()} title="Change password">
+      <Modal open={pwOpen} onOpenChange={(v) => !v && closePw()} title="Change passcode">
         {!oldOk ? (
           <form
             className="space-y-4"
@@ -104,26 +104,26 @@ export function SecuritySection() {
               const ok = await verify(oldPw);
               setBusy(false);
               if (ok) setOldOk(true);
-              else setErr('Incorrect password');
+              else setErr('Incorrect passcode');
             }}
           >
-            <PasswordInput label="Current password" value={oldPw} onChange={(e) => setOldPw(e.target.value)} error={err} autoFocus />
+            <PasswordInput label="Current passcode" value={oldPw} onChange={(e) => setOldPw(e.target.value)} error={err} autoFocus />
             <Button type="submit" variant="primary" block loading={busy} disabled={!oldPw}>
               Continue
             </Button>
           </form>
         ) : (
           <PasswordSetup
-            submitLabel="Update password"
+            submitLabel="Update passcode"
             loading={busy}
             onSubmit={async (pw) => {
               setBusy(true);
               try {
                 await changePassword(oldPw, pw);
-                toast.success('Password updated');
+                toast.success('Passcode updated');
                 closePw();
               } catch (e) {
-                toast.error(e instanceof InvalidPasswordError ? 'Current password is incorrect' : (e as Error).message);
+                toast.error(e instanceof InvalidPasswordError ? 'Current passcode is incorrect' : (e as Error).message);
               } finally {
                 setBusy(false);
               }

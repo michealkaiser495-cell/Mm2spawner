@@ -51,21 +51,21 @@ export function Unlock() {
           <LogoMark size={68} />
         </div>
         <h1 className="font-display text-2xl font-bold">Welcome back</h1>
-        <p className="mb-6 mt-1 text-sm text-mist-400">Enter your password to unlock</p>
+        <p className="mb-6 mt-1 text-sm text-mist-400">Enter your passcode to unlock</p>
         <div className="text-left">
-          <PasswordInput value={pw} onChange={(e) => setPw(e.target.value)} placeholder="Password" autoFocus error={error} aria-label="Password" />
+          <PasswordInput value={pw} onChange={(e) => setPw(e.target.value)} placeholder="Passcode" autoFocus error={error} aria-label="Passcode" />
         </div>
         <Button type="submit" variant="primary" size="lg" block className="mt-4" loading={busy} disabled={!pw || wait > 0}>
           <Lock className="h-4 w-4" /> {wait > 0 ? `Try again in ${Math.ceil(wait / 1000)}s` : 'Unlock'}
         </Button>
         <button type="button" onClick={() => setResetOpen(true)} className="mt-5 text-xs text-mist-400 hover:text-mist-200">
-          Forgot password?
+          Forgot passcode?
         </button>
       </form>
 
       <Modal open={resetOpen} onOpenChange={setResetOpen} title="Reset Nocta on this device">
         <div className="space-y-4 text-sm text-mist-300">
-          <p>Your password cannot be recovered. You can remove the wallet from this device and restore it with your recovery phrase.</p>
+          <p>Your passcode cannot be recovered. You can remove the wallet from this device and restore it with your recovery phrase.</p>
           <p className="rounded-xl border border-down/30 bg-down/[0.08] p-3 text-down">
             Without your recovery phrase (and backups of any imported private keys), your funds will be permanently lost.
           </p>

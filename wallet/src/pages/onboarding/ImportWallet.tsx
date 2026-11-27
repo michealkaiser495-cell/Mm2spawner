@@ -48,8 +48,8 @@ export function ImportWallet() {
         </div>
       ) : (
         <div className="mt-5">
-          <h2 className="font-display text-2xl font-bold">Set a password</h2>
-          <p className="mb-6 mt-1 text-sm text-mist-400">Used to unlock Nocta on this device.</p>
+          <h2 className="font-display text-2xl font-bold">Set a passcode</h2>
+          <p className="mb-6 mt-1 text-sm text-mist-400">A number used to unlock Nocta on this device.</p>
           <PasswordSetup onSubmit={finish} submitLabel="Import wallet" loading={busy} />
         </div>
       )}

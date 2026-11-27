@@ -208,6 +208,7 @@ function TokenRow({ a }: { a: Asset }) {
 
 function Holdings() {
   const p = usePortfolio();
+  const { config } = useNetwork();
   const [q, setQ] = useState('');
   const list = useMemo(() => {
     const s = q.trim().toLowerCase();
@@ -218,6 +219,12 @@ function Holdings() {
     <Card className="p-3 sm:p-4">
       <div className="px-2 pt-1">
         <SectionTitle action={<span className="text-xs text-mist-400">{p.assets.length} assets</span>}>Tokens</SectionTitle>
+        {p.tokensPartial && !config.isTestnet && (
+          <Notice className="mb-2">
+            SOL is loaded. The free public RPC can’t list SPL tokens — add a free RPC URL (e.g. Helius) in{' '}
+            <Link to="/settings/network" className="font-semibold text-accent hover:underline">Settings → Network</Link> to see your tokens.
+          </Notice>
+        )}
         <div className="relative mb-2">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-mist-400" />
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search your tokens" aria-label="Search your tokens" className="h-10 w-full rounded-xl border border-white/[0.06] bg-white/[0.03] pl-9 pr-3 text-sm outline-none focus:border-[var(--accent-from)]" />
