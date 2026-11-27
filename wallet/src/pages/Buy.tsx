@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { CrossmintProvider, CrossmintHostedCheckout } from '@crossmint/client-sdk-react-ui';
 import { ArrowDownLeft, CreditCard, Droplets, ExternalLink, Settings2, ShieldCheck } from 'lucide-react';
-import { CROSSMINT_MAX_USD, CROSSMINT_MIN_USD, crossmintDeliversTo, crossmintEnv, USDC_MINT_MAINNET, usdcTokenLocator } from '@/lib/crossmint';
+import { CROSSMINT_MAX_USD, CROSSMINT_MIN_USD, crossmintDeliversTo, crossmintEnv, DEFAULT_CROSSMINT_CLIENT_KEY, USDC_MINT_MAINNET, usdcTokenLocator } from '@/lib/crossmint';
 import { NATIVE_MINT } from '@/lib/solana/balances';
 import { NETWORKS } from '@/lib/solana/networks';
 import { useNetwork } from '@/hooks/useNetwork';
@@ -174,7 +174,8 @@ function CrossmintSetup() {
 export function Buy() {
   const navigate = useNavigate();
   const { config } = useNetwork();
-  const clientKey = useSettings((s) => s.crossmintClientKey);
+  // Use the user's own key if set, otherwise the built-in (origin-restricted) client key.
+  const clientKey = useSettings((s) => s.crossmintClientKey) || DEFAULT_CROSSMINT_CLIENT_KEY;
 
   return (
     <div className="mx-auto max-w-lg">

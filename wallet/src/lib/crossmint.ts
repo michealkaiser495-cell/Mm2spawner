@@ -12,6 +12,19 @@ export const USDC_MINT_MAINNET = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 // Crossmint staging settles on Solana devnet with a test USDC mint.
 export const USDC_MINT_STAGING = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
 
+/**
+ * Built-in Crossmint CLIENT key. Safe to ship in the browser — it is origin-restricted (only
+ * works from the app's whitelisted domains) and limited to the `orders.create` scope, exactly
+ * like a Stripe publishable key. NEVER put a secret (sk_) key here. Users can override this in
+ * Settings → Buy. This is a STAGING (test) key, so purchases run in test mode on devnet; swap it
+ * for a ck_production_ key (set in Settings, or here) to take real payments.
+ *
+ * Requires the app's origin (e.g. https://cryptowalletno.lovable.app and http://localhost:4173)
+ * to be whitelisted on the key in the Crossmint dashboard.
+ */
+export const DEFAULT_CROSSMINT_CLIENT_KEY =
+  'ck_staging_2zcJYTJg7sGmpJJy76fPeVdgv6JA885HYJeunVunkqwtQj13b5M5oe2BwQRyhqkmjqd8JneGaDMhEgDEgx86zGEidJBphpKhyrvGmhDotiD2R9CMEcK8Kw3B9Rgp3V9vQTDQv8WcLmsGUrD947gJr3TKgNA91RPHVstD3Eh2TyKjkHgGfwz6wyHaTGacXdwMRyiE6KGGvoNRuUDbTDoPRjF';
+
 export type CrossmintEnv = 'staging' | 'production';
 
 export function crossmintEnv(clientKey: string): CrossmintEnv {

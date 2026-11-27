@@ -10,7 +10,7 @@ import { ACCENTS, useSettings, type AccentId } from '@/state/settings';
 import { useWallet } from '@/state/wallet';
 import { Badge, Button, cn, Input, Notice, Segmented, Switch } from '@/components/ui/primitives';
 import { Modal } from '@/components/ui/Modal';
-import { crossmintEnv, isValidClientKey } from '@/lib/crossmint';
+import { crossmintEnv, DEFAULT_CROSSMINT_CLIENT_KEY, isValidClientKey } from '@/lib/crossmint';
 import { NetworkDot, useSwitchNetwork } from '@/components/wallet/NetworkSelector';
 import { SettingRow, SettingsCard } from './parts';
 
@@ -309,7 +309,7 @@ export function BuySection() {
             onChange={(e) => setKey(e.target.value.trim())}
             className="font-mono text-xs"
             error={key && isSecret ? 'That is a SECRET key. Never use sk_ keys in an app — use a client (ck_) key.' : key && !validClient ? 'Must be a Crossmint client key starting with ck_' : undefined}
-            hint={validClient ? `Valid ${env} client key` : 'Create one at crossmint.com with the orders.create scope and your app origin.'}
+            hint={validClient ? `Valid ${env} client key` : clientKey ? 'Invalid key' : `Leave blank to use the built-in ${crossmintEnv(DEFAULT_CROSSMINT_CLIENT_KEY)} test key. Paste a ck_production_ key for real purchases.`}
           />
           <Input label="Receipt email (optional)" type="email" value={email} onChange={(e) => setEmail(e.target.value.trim())} placeholder="you@example.com" className="mt-3" hint="Crossmint sends purchase receipts here." />
           <div className="mt-3 flex gap-2">
