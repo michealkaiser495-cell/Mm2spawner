@@ -10,7 +10,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:chain": "vite-node e2e/chain-integration.ts",
-    "test:e2e": "node e2e/smoke.mjs"
+    "test:e2e": "node e2e/smoke.mjs",
+    "deploy:bunny": "node scripts/deploy-bunny.mjs"
   },
   "license": "MIT",
   "dependencies": {
