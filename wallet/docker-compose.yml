@@ -1,0 +1,20 @@
+# Runs Nocta 24/7 on your machine and (optionally) exposes it to the internet
+# behind Cloudflare's CDN via a Cloudflare Tunnel. See SELF-HOST.md.
+services:
+  nocta:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:80"      # open http://localhost:8080 locally
+
+  # OPTIONAL public access behind Cloudflare's CDN. Set CLOUDFLARE_TUNNEL_TOKEN in a .env
+  # file (from the Cloudflare Zero Trust dashboard) and point the tunnel's public hostname
+  # at the service http://nocta:80. Remove this block if you only want local access.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - nocta
