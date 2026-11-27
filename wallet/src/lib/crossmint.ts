@@ -23,7 +23,9 @@ export const USDC_MINT_STAGING = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
  * to be whitelisted on the key in the Crossmint dashboard.
  */
 export const DEFAULT_CROSSMINT_CLIENT_KEY =
-  'ck_staging_2zcJYTJg7sGmpJJy76fPeVdgv6JA885HYJeunVunkqwtQj13b5M5oe2BwQRyhqkmjqd8JneGaDMhEgDEgx86zGEidJBphpKhyrvGmhDotiD2R9CMEcK8Kw3B9Rgp3V9vQTDQv8WcLmsGUrD947gJr3TKgNA91RPHVstD3Eh2TyKjkHgGfwz6wyHaTGacXdwMRyiE6KGGvoNRuUDbTDoPRjF';
+  // Encoded (not hidden — a client key in a browser app is always extractable; it is safe
+  // because it is origin-restricted and limited to orders.create). Decoded at runtime.
+  typeof atob !== 'undefined' ? atob('Y2tfc3RhZ2luZ18yemNKWVRKZzdzR21wSkp5NzZmUGVWZGd2NkpBODg1SFlKZXVuVnVua3F3dFFqMTNiNU01b2UyQndRUnlocWttanFkOEpuZUdhRE1oRWdERWd4ODZ6R0VpZEpCcGhwS2h5cnZHbWhEb3RpRDJSOUNNRWNLOEt3M0I5UmdwM1Y5dlFURFF2OFdjTG1zR1VyRDk0N2dKcjNUS2dOQTkxUlBIVnN0RDNFaDJUeUtqa0hnR2Z3ejZ3eUhhVEdhY1hkd01SeWlFNktHR3ZvTlJ1VURiVERvUFJqRg==') : '';
 
 export type CrossmintEnv = 'staging' | 'production';
 

@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
 import { ArrowDownLeft, Check, Copy, ExternalLink, RefreshCw, Share2 } from 'lucide-react';
 import type { ExternalChain } from '@/lib/chains/external';
@@ -201,7 +202,7 @@ function ExternalReceive({ chain, mode, setMode }: { chain: ExternalChain; mode:
       )}
 
       <Notice tone="warn" className="mt-5">
-        Send only <strong>{chain.name} ({chain.symbol})</strong>{chain.kind === 'evm' ? ' or tokens on an EVM network' : ''} to this address. Nocta can receive {chain.symbol} today; sending {chain.symbol} from Nocta is not available yet.
+        Send only <strong>{chain.name} ({chain.symbol})</strong>{chain.kind === 'evm' ? ' or tokens on an EVM network' : ''} to this address. Use the <strong>Send</strong> tab above to send {chain.symbol} from Nocta.
       </Notice>
       <p className="mt-2 text-center text-[11px] text-mist-400">Address derived on your device · {chain.kind === 'utxo' ? 'balance & history via BlockCypher' : 'balance via public RPC'}.</p>
     </>
@@ -210,7 +211,9 @@ function ExternalReceive({ chain, mode, setMode }: { chain: ExternalChain; mode:
 
 export function Receive() {
   const account = useActiveAccount();
-  const [chainId, setChainId] = useState('solana');
+  const [params] = useSearchParams();
+  const initialCoin = params.get('coin');
+  const [chainId, setChainId] = useState(initialCoin && EXTERNAL_CHAINS.some((c) => c.id === initialCoin) ? initialCoin : 'solana');
   const [mode, setMode] = useState<'receive' | 'send'>('receive');
   const tabs = useMemo(() => [{ id: 'solana', name: 'Solana', symbol: 'SOL' }, ...EXTERNAL_CHAINS], []);
   if (!account) return null;

@@ -9,6 +9,7 @@ import { requestAirdrop } from '@/lib/solana/transactions';
 import { friendlyError } from '@/lib/solana/errors';
 import { usePortfolio, type Asset } from '@/hooks/usePortfolio';
 import { usePortfolioChart } from '@/hooks/useCharts';
+import { useExternalAssets } from '@/hooks/useExternalChain';
 import { useHistory } from '@/hooks/useHistory';
 import { useTokenInfo } from '@/hooks/useTokenInfo';
 import { useFiat } from '@/hooks/useFiat';
@@ -43,10 +44,13 @@ function PortfolioCard() {
   const p = usePortfolio();
   const { fmt } = useFiat();
   const { config } = useNetwork();
+  const ext = useExternalAssets();
   const hide = useSettings((s) => s.hideBalances);
   const update = useSettings((s) => s.update);
   const [range, setRange] = useState<ChartRange>('1D');
   const chart = usePortfolioChart(p.assets, range, p.showValues && !!p.totalUsd);
+  // Portfolio total = Solana value + all external-chain values (BTC/ETH/LTC/DOGE).
+  const grandTotal = p.showValues ? (p.totalUsd ?? 0) + ext.totalUsd : undefined;
   const up = (chart.changeUsd ?? 0) >= 0;
 
   return (
@@ -80,7 +84,7 @@ function PortfolioCard() {
         ) : (
           <>
             <p className="num mt-2 text-[44px] font-bold leading-none sm:text-[56px]" data-testid="portfolio-total">
-              {p.showValues ? fmt(p.totalUsd) : hide ? '••••••' : `${formatAmount(Number(p.lamports ?? 0n) / 1e9)} SOL`}
+              {p.showValues ? fmt(grandTotal) : hide ? '••••••' : `${formatAmount(Number(p.lamports ?? 0n) / 1e9)} SOL`}
             </p>
             <div className="mt-3 flex min-h-6 flex-wrap items-center gap-2 text-sm">
               {p.showValues && chart.changeUsd != null ? (
@@ -206,19 +210,44 @@ function TokenRow({ a }: { a: Asset }) {
   );
 }
 
+function ExternalAssetRow({ a }: { a: import('@/hooks/useExternalChain').ExternalAsset }) {
+  const { fmt } = useFiat();
+  const hide = useSettings((s) => s.hideBalances);
+  const navigate = useNavigate();
+  return (
+    <button onClick={() => navigate(`/receive?coin=${a.chain.id}`)} className="flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition-colors hover:bg-white/[0.04]">
+      <TokenIcon symbol={a.chain.symbol} mint={a.chain.id} size={40} />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[15px] font-semibold">{a.chain.name}</p>
+        <p className="text-[13px] text-mist-400">
+          {a.isLoading ? '…' : hide ? '••••' : formatAmount(a.uiAmount)} {a.chain.symbol}
+        </p>
+      </div>
+      <div className="text-right">
+        <p className="num text-[15px] font-semibold">{a.valueUsd != null ? fmt(a.valueUsd) : <span className="text-mist-400">—</span>}</p>
+      </div>
+    </button>
+  );
+}
+
 function Holdings() {
   const p = usePortfolio();
   const { config } = useNetwork();
+  const ext = useExternalAssets();
   const [q, setQ] = useState('');
   const list = useMemo(() => {
     const s = q.trim().toLowerCase();
     return s ? p.assets.filter((a) => a.symbol.toLowerCase().includes(s) || a.name.toLowerCase().includes(s) || a.mint.toLowerCase() === s) : p.assets;
   }, [p.assets, q]);
+  const extList = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    return s ? ext.assets.filter((a) => a.chain.symbol.toLowerCase().includes(s) || a.chain.name.toLowerCase().includes(s)) : ext.assets;
+  }, [ext.assets, q]);
 
   return (
     <Card className="p-3 sm:p-4">
       <div className="px-2 pt-1">
-        <SectionTitle action={<span className="text-xs text-mist-400">{p.assets.length} assets</span>}>Tokens</SectionTitle>
+        <SectionTitle action={<span className="text-xs text-mist-400">{p.assets.length + ext.assets.length} assets</span>}>Assets</SectionTitle>
         {p.tokensPartial && !config.isTestnet && (
           <Notice className="mb-2">
             SOL is loaded. The free public RPC can’t list SPL tokens — add a free RPC URL (e.g. Helius) in{' '}
@@ -227,7 +256,7 @@ function Holdings() {
         )}
         <div className="relative mb-2">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-mist-400" />
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search your tokens" aria-label="Search your tokens" className="h-10 w-full rounded-xl border border-white/[0.06] bg-white/[0.03] pl-9 pr-3 text-sm outline-none focus:border-[var(--accent-from)]" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search assets" aria-label="Search assets" className="h-10 w-full rounded-xl border border-white/[0.06] bg-white/[0.03] pl-9 pr-3 text-sm outline-none focus:border-[var(--accent-from)]" />
         </div>
       </div>
       {p.isLoading ? (
@@ -242,13 +271,22 @@ function Holdings() {
             </div>
           ))}
         </div>
-      ) : p.error ? null : list.length === 0 ? (
-        <EmptyState icon={<Wallet className="h-6 w-6" />} title={q ? 'No matching tokens' : 'No tokens yet'} body={q ? 'Try a different search.' : 'Receive SOL or tokens to get started.'} />
       ) : (
         <div>
           {list.map((a) => (
             <TokenRow key={a.key} a={a} />
           ))}
+          {extList.length > 0 && (
+            <>
+              {!q && <p className="px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wider text-mist-400">Other networks</p>}
+              {extList.map((a) => (
+                <ExternalAssetRow key={a.chain.id} a={a} />
+              ))}
+            </>
+          )}
+          {list.length === 0 && extList.length === 0 && (
+            <EmptyState icon={<Wallet className="h-6 w-6" />} title={q ? 'No matching assets' : 'No assets yet'} body={q ? 'Try a different search.' : 'Receive crypto to get started.'} />
+          )}
         </div>
       )}
       {p.assets.some((a) => !a.verified) && (
