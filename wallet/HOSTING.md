@@ -13,9 +13,10 @@ and point users to receive from an exchange; everything else works.
 
 ## Full app incl. Buy (Netlify, ~5 min)
 
-1. Push this repo to GitHub (already done) and go to https://app.netlify.com → **Add new site →
-   Import from GitHub** → pick your repo. Netlify reads `netlify.toml` (base `wallet`, build
-   `npm run build`, publish `dist`, functions `netlify/functions`) automatically.
+1. Go to https://app.netlify.com → **Add new site → Import an existing project → GitHub** →
+   pick `Mm2spawner` and set **Branch to deploy** = `claude/crypto-wallet-app-s3fjpf`. Leave every
+   build field as it is: Netlify reads `netlify.toml` from the repo root (base `wallet`, build
+   `npm run build`, publish `dist`, functions `netlify/functions`).
 2. In **Site settings → Environment variables**, add:
    - `CROSSMINT_SERVER_KEY` = your Crossmint **server** key (`sk_staging_…` for test,
      `sk_production_…` for live). This lives only on Netlify's servers — never in the app, never

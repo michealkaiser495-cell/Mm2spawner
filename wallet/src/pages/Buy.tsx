@@ -48,7 +48,7 @@ function BuyWithCrossmint({ clientKey }: { clientKey: string }) {
         body: JSON.stringify({ amount: String(n), email: email.trim(), walletAddress: account.publicKey }),
       });
       if (res.status === 404) {
-        setError('Card buying needs the Crossmint server function deployed. See HOSTING — meanwhile you can receive from an exchange below.');
+        setError('This copy of the site was uploaded by drag-and-drop, which can’t run the checkout server. Redeploy with Netlify “Import from GitHub” (see HOSTING.md). Meanwhile you can receive from an exchange below.');
         return;
       }
       const data = await res.json();
