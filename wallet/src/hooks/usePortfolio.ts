@@ -37,7 +37,8 @@ export function usePortfolioQuery() {
     queryKey: ['portfolio', network, rpcUrl, account?.publicKey],
     queryFn: () => fetchPortfolio(conn, account!.publicKey),
     enabled: !!account,
-    refetchInterval: 20_000,
+    refetchInterval: 12_000,
+    refetchOnMount: 'always',
     // Public RPCs rate-limit aggressively; back off and retry before surfacing an error.
     retry: (n, err) => n < (/429|too many/i.test(String((err as Error)?.message)) ? 4 : 1),
     retryDelay: (n) => Math.min(800 * 2 ** n, 8000),
@@ -152,6 +153,7 @@ export function usePortfolio() {
     change24hUsd,
     showValues,
     lamports: chain.data?.lamports,
+    tokensPartial: chain.data?.tokensPartial ?? false,
     isLoading: chain.isLoading,
     isFetching: chain.isFetching || prices.isFetching,
     error: chain.error,
