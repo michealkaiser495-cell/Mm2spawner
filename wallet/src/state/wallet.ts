@@ -1,11 +1,11 @@
 import { create } from 'zustand';
 import type { Keypair } from '@solana/web3.js';
-import { decryptVault, encryptVault, encryptWithKey, type EncryptedVault, InvalidPasswordError, isEncryptedVault } from '@/lib/crypto/vault';
+import { decryptVault, decryptWithKey, encryptVault, encryptWithKey, importVaultKey, type EncryptedVault, InvalidPasswordError, isEncryptedVault } from '@/lib/crypto/vault';
 import { encodeSecretKey, isValidMnemonic, keypairFromMnemonic, normalizeMnemonic, parsePrivateKey } from '@/lib/crypto/keys';
 import { type LtcAddressType } from '@/lib/crypto/litecoin';
 import { getExternalChain } from '@/lib/chains/external';
 import { randomId } from '@/lib/crypto/encoding';
-import { clearSession, getSession, hasSession, setSession, type KeyringSecret, type VaultPayload } from './session';
+import { clearSession, getSession, hasSession, readStoredSessionKey, restoreSession, setSession, type KeyringSecret, type VaultPayload } from './session';
 
 const VAULT_KEY = 'nocta:vault:v1';
 const META_KEY = 'nocta:meta:v1';
@@ -39,6 +39,8 @@ export type WalletStatus = 'empty' | 'locked' | 'unlocked';
 
 interface WalletState extends Meta {
   status: WalletStatus;
+  restoring: boolean;
+  restoreSession: () => Promise<void>;
   // lifecycle
   createVault: (opts: { password: string; secret: NewSecret; accountName?: string }) => Promise<void>;
   unlock: (password: string) => Promise<void>;
@@ -144,6 +146,7 @@ function keypairFor(account: Account): Keypair {
 
 const initialMeta = readMeta();
 const initialStatus: WalletStatus = readVault() ? 'locked' : 'empty';
+const initialRestoring = initialStatus === 'locked' && !!readStoredSessionKey();
 
 export const useWallet = create<WalletState>((set, get) => {
   const commitMeta = (patch: Partial<Meta>) => {
@@ -164,6 +167,7 @@ export const useWallet = create<WalletState>((set, get) => {
   return {
     ...initialMeta,
     status: initialStatus,
+    restoring: initialRestoring,
 
     async createVault({ password, secret, accountName }) {
       if (readVault()) throw new Error('A wallet already exists on this device');
@@ -206,8 +210,27 @@ export const useWallet = create<WalletState>((set, get) => {
       }
     },
 
+    /** Restore an unlocked session from sessionStorage after a page refresh (no passcode needed). */
+    async restoreSession() {
+      if (!get().restoring) return;
+      const stored = readStoredSessionKey();
+      const vault = readVault();
+      try {
+        if (!stored || !vault) throw new Error('no session');
+        const vk = await importVaultKey(stored.k, stored.salt, stored.iter);
+        const payload = await decryptWithKey<VaultPayload>(vault, vk);
+        restoreSession(vk, payload);
+        const meta = readMeta();
+        set({ ...meta, status: 'unlocked', restoring: false, activeAccountId: meta.activeAccountId ?? meta.accounts[0]?.id ?? null });
+      } catch {
+        clearSession();
+        set({ restoring: false });
+      }
+    },
+
     lock() {
       clearSession();
+      set({ restoring: false });
       if (get().status === 'unlocked') set({ status: 'locked' });
     },
 

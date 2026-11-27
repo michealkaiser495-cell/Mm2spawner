@@ -156,7 +156,7 @@ await page.getByRole('button', { name: 'Lock', exact: true }).click();
 await page.waitForURL(/unlock/);
 await page.getByLabel('Passcode', { exact: true }).fill('999999');
 await page.getByRole('button', { name: 'Unlock' }).click();
-await page.getByText('Incorrect password').waitFor();
+await page.getByText('Incorrect passcode').waitFor();
 await shot('15-unlock-error');
 await page.getByLabel('Passcode', { exact: true }).fill(PASSWORD);
 await page.getByRole('button', { name: 'Unlock' }).click();
@@ -165,13 +165,12 @@ await page.waitForURL((u) => !u.hash.includes('unlock'));
 await page.getByRole('navigation', { name: 'Main' }).first().waitFor();
 log('lock/unlock ✓ (returned to', new URL(page.url()).hash + ')');
 
-// Reload must lock (secrets are memory-only)
+// Reload keeps the wallet unlocked (session persists until tab close / lock / auto-lock).
+await page.goto(`${BASE}/#/`);
 await page.reload();
-await page.waitForURL(/unlock/);
-log('reload locks wallet ✓');
-await page.getByLabel('Passcode', { exact: true }).fill(PASSWORD);
-await page.getByRole('button', { name: 'Unlock' }).click();
-await page.waitForURL((u) => !u.hash.includes('unlock'));
+await page.getByText('Recent activity').waitFor({ timeout: 15000 });
+if (page.url().includes('unlock')) throw new Error('reload should NOT lock the wallet');
+log('reload keeps wallet unlocked ✓');
 
 // ---- Mobile layout
 await page.setViewportSize({ width: 390, height: 844 });

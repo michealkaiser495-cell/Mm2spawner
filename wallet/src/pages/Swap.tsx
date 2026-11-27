@@ -30,6 +30,30 @@ const USDC: PickableToken = {
   verified: true,
   icon: 'https://static.datapi.jup.ag/token-icons/6c4e5669d2a438653105399865445682e4a6cb51e19e1e61dc97578cd27bb9b2.webp',
 };
+// Popular Solana tokens, always shown in the pickers so the list is never empty.
+const POPULAR_TOKENS: PickableToken[] = [
+  { mint: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', symbol: 'USDT', name: 'Tether USD', decimals: 6, verified: true },
+  { mint: 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN', symbol: 'JUP', name: 'Jupiter', decimals: 6, verified: true },
+  { mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', symbol: 'BONK', name: 'Bonk', decimals: 5, verified: true },
+  { mint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', symbol: 'WIF', name: 'dogwifhat', decimals: 6, verified: true },
+  { mint: '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R', symbol: 'RAY', name: 'Raydium', decimals: 6, verified: true },
+  { mint: 'HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3', symbol: 'PYTH', name: 'Pyth Network', decimals: 6, verified: true },
+  { mint: 'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL', symbol: 'JTO', name: 'Jito', decimals: 9, verified: true },
+  { mint: '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', symbol: 'POPCAT', name: 'Popcat', decimals: 9, verified: true },
+];
+
+/** Merge holdings with SOL/USDC + popular tokens, de-duplicated by mint. */
+function withDefaults(holdings: PickableToken[]): PickableToken[] {
+  const seen = new Set<string>();
+  const out: PickableToken[] = [];
+  for (const t of [...holdings, SOL, USDC, ...POPULAR_TOKENS]) {
+    if (seen.has(t.mint)) continue;
+    seen.add(t.mint);
+    out.push(t);
+  }
+  return out;
+}
+
 const SLIPPAGE_PRESETS = [10, 50, 100, 300];
 const QUOTE_REFRESH_MS = 15_000;
 
@@ -362,7 +386,7 @@ export function Swap() {
       <TokenPicker
         open={picker !== null}
         onOpenChange={(v) => !v && setPicker(null)}
-        tokens={picker === 'from' ? holdingTokens : [SOL, USDC, ...holdingTokens.filter((t) => t.mint !== SOL.mint && t.mint !== USDC.mint)]}
+        tokens={withDefaults(holdingTokens)}
         remoteSearch
         title={picker === 'from' ? 'Swap from' : 'Swap to'}
         onSelect={(t) => {

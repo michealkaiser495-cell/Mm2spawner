@@ -25,7 +25,7 @@ export interface EncryptedVault {
 
 export class InvalidPasswordError extends Error {
   constructor() {
-    super('Incorrect password');
+    super('Incorrect passcode');
     this.name = 'InvalidPasswordError';
   }
 }
@@ -48,10 +48,29 @@ export async function deriveVaultKey(
     { name: 'PBKDF2', hash: 'SHA-256', salt, iterations },
     material,
     { name: 'AES-GCM', length: 256 },
-    false, // non-extractable
+    true, // extractable so it can be stashed in sessionStorage to survive a page refresh
     ['encrypt', 'decrypt'],
   );
   return { key, salt, iterations };
+}
+
+/** Export/import the raw AES key — used to keep the wallet unlocked across a page refresh. */
+export async function exportKeyRaw(vk: VaultKey): Promise<string> {
+  return bytesToBase64(new Uint8Array(await crypto.subtle.exportKey('raw', vk.key)));
+}
+export async function importVaultKey(rawB64: string, saltB64: string, iterations: number): Promise<VaultKey> {
+  const key = await crypto.subtle.importKey('raw', base64ToBytes(rawB64), 'AES-GCM', true, ['encrypt', 'decrypt']);
+  return { key, salt: base64ToBytes(saltB64), iterations };
+}
+
+/** Decrypt a vault with an already-derived key (no password needed). */
+export async function decryptWithKey<T>(vault: EncryptedVault, vk: VaultKey): Promise<T> {
+  if (!isEncryptedVault(vault)) throw new Error('Vault data is corrupted');
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToBytes(vault.cipher.iv), additionalData: AAD }, vk.key, base64ToBytes(vault.data));
+  const bytes = new Uint8Array(pt);
+  const payload = JSON.parse(fromUtf8(bytes)) as T;
+  bytes.fill(0);
+  return payload;
 }
 
 export async function encryptWithKey<T>(payload: T, vk: VaultKey): Promise<EncryptedVault> {

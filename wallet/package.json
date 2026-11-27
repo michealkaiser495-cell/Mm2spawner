@@ -32,6 +32,7 @@
     "bs58": "^6.0.0",
     "buffer": "^6.0.3",
     "clsx": "^2.1.1",
+    "jsqr": "^1.4.0",
     "lucide-react": "^1.81.0",
     "micro-key-producer": "^0.7.6",
     "qrcode.react": "^4.2.0",

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
-import { ArrowUpRight, ClipboardPaste, ShieldAlert } from 'lucide-react';
+import { ArrowUpRight, ClipboardPaste, QrCode, ShieldAlert } from 'lucide-react';
 import { checkAddress } from '@/lib/solana/address';
 import { friendlyError } from '@/lib/solana/errors';
 import { prepareTransfer, signAndSend, type PreparedTransaction, type TransferAsset, type TxPhase } from '@/lib/solana/transactions';
@@ -18,6 +18,7 @@ import { TokenButton, TokenPicker, type PickableToken } from '@/components/walle
 import { TokenIcon } from '@/components/ui/TokenIcon';
 import { TxSafetyPanel, TxStatus, feeLine } from '@/components/wallet/TxParts';
 import { PasswordPrompt } from '@/components/wallet/PasswordPrompt';
+import { QrScanner } from '@/components/wallet/QrScanner';
 
 /** Remember recent submissions to catch accidental duplicates (in-memory only). */
 const recentSends = new Map<string, number>();
@@ -49,6 +50,8 @@ export function Send() {
   const [assetKey, setAssetKey] = useState(params.get('mint') ?? 'SOL');
   const [recipient, setRecipient] = useState(params.get('to') ?? '');
   const [amountStr, setAmountStr] = useState('');
+  const [usdMode, setUsdMode] = useState(false);
+  const [scanOpen, setScanOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [prepareError, setPrepareError] = useState<string>();
@@ -65,13 +68,19 @@ export function Send() {
   const asset = p.assets.find((a) => (assetKey === 'SOL' ? a.isNative : a.mint === assetKey)) ?? p.assets[0];
 
   const addr = useMemo(() => (recipient ? checkAddress(recipient) : null), [recipient]);
-  const amount = asset ? parseUnits(amountStr, asset.decimals) : null;
+  // USD mode: the field is a dollar amount, converted to the token amount using its price.
+  const cryptoStr = usdMode ? (asset?.priceUsd && Number(amountStr) > 0 ? (Number(amountStr) / asset.priceUsd).toFixed(Math.min(asset.decimals, 9)) : '') : amountStr;
+  const amount = asset ? parseUnits(cryptoStr, asset.decimals) : null;
   const amountError =
     amountStr && amount == null
-      ? `Invalid amount (max ${asset?.decimals} decimals)`
+      ? usdMode
+        ? 'Invalid amount'
+        : `Invalid amount (max ${asset?.decimals} decimals)`
       : amount != null && asset && amount > asset.amount
         ? 'Exceeds your balance'
-        : undefined;
+        : usdMode && !asset?.priceUsd
+          ? `No price — switch to ${asset?.symbol}`
+          : undefined;
   const fiatValue = amount != null && asset?.priceUsd ? toNumber(amount, asset.decimals) * asset.priceUsd : undefined;
 
   const fingerprint = `${network}|${account?.publicKey}|${addr?.valid ? addr.pubkey.toBase58() : ''}|${asset?.key}|${amount}`;
@@ -94,8 +103,10 @@ export function Send() {
   const setMax = () => {
     if (!asset) return;
     const max = asset.isNative ? (asset.amount > SOL_RESERVE + 10_000n ? asset.amount - SOL_RESERVE - 10_000n : 0n) : asset.amount;
+    setUsdMode(false); // Max is entered in the token's own units
     setAmountStr(formatUnits(max, asset.decimals));
   };
+  const amountEquiv = usdMode ? (amount != null && asset ? `${formatAmount(toNumber(amount, asset.decimals))} ${asset.symbol}` : '') : fiatValue != null ? `≈ ${fmt(fiatValue, { ignoreHide: true })}` : '';
 
   const canReview = !!asset && addr?.valid && amount != null && amount > 0n && !amountError && !preparing;
 
@@ -283,20 +294,25 @@ export function Send() {
               hint={addr?.valid ? (addr.pubkey.toBase58() === account.publicKey ? 'This is your own address' : addr.onCurve ? 'Valid Solana address' : 'Valid address (program-derived — no private key)') : undefined}
               data-testid="recipient"
               right={
-                <button
-                  type="button"
-                  className="rounded-lg p-2 text-mist-400 hover:text-mist-100"
-                  aria-label="Paste address"
-                  onClick={async () => {
-                    try {
-                      setRecipient((await navigator.clipboard.readText()).trim());
-                    } catch {
-                      /* clipboard blocked */
-                    }
-                  }}
-                >
-                  <ClipboardPaste className="h-4 w-4" />
-                </button>
+                <span className="flex items-center">
+                  <button type="button" className="rounded-lg p-2 text-mist-400 hover:text-mist-100" aria-label="Scan QR code" onClick={() => setScanOpen(true)}>
+                    <QrCode className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-lg p-2 text-mist-400 hover:text-mist-100"
+                    aria-label="Paste address"
+                    onClick={async () => {
+                      try {
+                        setRecipient((await navigator.clipboard.readText()).trim());
+                      } catch {
+                        /* clipboard blocked */
+                      }
+                    }}
+                  >
+                    <ClipboardPaste className="h-4 w-4" />
+                  </button>
+                </span>
               }
             />
             {!recipient && recentRecipients.length > 0 && (
@@ -310,25 +326,32 @@ export function Send() {
             )}
           </div>
 
-          <Input
-            label="Amount"
-            inputMode="decimal"
-            placeholder="0.00"
-            value={amountStr}
-            onChange={(e) => setAmountStr(e.target.value.replace(/[^\d.]/g, ''))}
-            className="num text-lg"
-            error={amountError}
-            hint={fiatValue != null ? `≈ ${fmt(fiatValue, { ignoreHide: true })}` : asset?.isNative ? 'Max keeps 0.001 SOL for rent & fees' : undefined}
-            data-testid="amount"
-            right={
-              <span className="flex items-center gap-2">
-                <span className="text-sm font-semibold text-mist-400">{asset?.symbol}</span>
-                <button type="button" onClick={setMax} className="rounded-lg bg-white/[0.07] px-2.5 py-1 text-xs font-bold text-accent hover:bg-white/[0.12]">
-                  MAX
-                </button>
-              </span>
-            }
-          />
+          <div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-sm font-medium text-mist-300">Amount</span>
+              <button type="button" onClick={() => { setUsdMode((v) => !v); setAmountStr(''); }} disabled={!asset?.priceUsd} className="rounded-lg bg-white/[0.06] px-2 py-1 text-xs font-semibold text-accent hover:bg-white/[0.1] disabled:opacity-40">
+                {usdMode ? `Switch to ${asset?.symbol}` : 'Switch to USD'}
+              </button>
+            </div>
+            <Input
+              inputMode="decimal"
+              placeholder="0.00"
+              value={amountStr}
+              onChange={(e) => setAmountStr(e.target.value.replace(/[^\d.]/g, ''))}
+              className="num text-lg"
+              error={amountError}
+              hint={amountEquiv || (asset?.isNative && !usdMode ? 'Max keeps 0.001 SOL for rent & fees' : undefined)}
+              data-testid="amount"
+              right={
+                <span className="flex items-center gap-2">
+                  <span className="text-sm font-semibold text-mist-400">{usdMode ? 'USD' : asset?.symbol}</span>
+                  <button type="button" onClick={setMax} className="rounded-lg bg-white/[0.07] px-2.5 py-1 text-xs font-bold text-accent hover:bg-white/[0.12]">
+                    MAX
+                  </button>
+                </span>
+              }
+            />
+          </div>
 
           {!config.isTestnet && <Notice tone="warn">You are on Mainnet. This sends real assets.</Notice>}
           {prepareError && <Notice tone="danger" title="Couldn't prepare transaction">{prepareError}</Notice>}
@@ -339,6 +362,7 @@ export function Send() {
         </Card>
       )}
       <TokenPicker open={pickerOpen} onOpenChange={setPickerOpen} tokens={sendable.map(toPickable)} onSelect={(t) => setAssetKey(t.mint)} title="Select asset to send" />
+      <QrScanner open={scanOpen} onOpenChange={setScanOpen} onScan={(a) => setRecipient(a)} />
     </div>
   );
 }

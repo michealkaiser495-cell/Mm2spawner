@@ -28,11 +28,22 @@ const queryClient = new QueryClient({
   },
 });
 
+function RestoringScreen() {
+  return (
+    <div className="grid min-h-dvh place-items-center">
+      <div className="aurora-bg" />
+      <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/15 border-t-[var(--accent-from)]" aria-label="Loading" />
+    </div>
+  );
+}
+
 /** Routes only reachable with an unlocked wallet. */
 function RequireUnlocked({ children }: { children: ReactNode }) {
   const status = useWallet((s) => s.status);
+  const restoring = useWallet((s) => s.restoring);
   const loc = useLocation();
   if (status === 'empty') return <Navigate to="/onboarding" replace />;
+  if (restoring) return <RestoringScreen />;
   if (status === 'locked') return <Navigate to="/unlock" replace state={{ from: loc.pathname + loc.search }} />;
   return <>{children}</>;
 }
@@ -47,7 +58,9 @@ function RequireEmpty({ children }: { children: ReactNode }) {
 
 function RequireLocked({ children }: { children: ReactNode }) {
   const status = useWallet((s) => s.status);
+  const restoring = useWallet((s) => s.restoring);
   if (status === 'empty') return <Navigate to="/onboarding" replace />;
+  if (restoring) return <RestoringScreen />;
   if (status === 'unlocked') return <Navigate to="/" replace />;
   return <>{children}</>;
 }
@@ -96,11 +109,20 @@ function ThemeSync() {
   return null;
 }
 
+function SessionRestore() {
+  const restoreSession = useWallet((s) => s.restoreSession);
+  useEffect(() => {
+    void restoreSession();
+  }, [restoreSession]);
+  return null;
+}
+
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delayDuration={200}>
         <ThemeSync />
+        <SessionRestore />
         <RouterProvider router={router} />
         <Toaster
           theme="dark"

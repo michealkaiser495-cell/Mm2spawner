@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { CheckCircle2, ExternalLink, Loader2, ShieldAlert, XCircle } from 'lucide-react';
+import { CheckCircle2, ExternalLink, Loader2, QrCode, ShieldAlert, XCircle } from 'lucide-react';
 import type { ExternalChain } from '@/lib/chains/external';
 import { EVM_CHAINS } from '@/lib/crypto/evm';
 import { UTXO_CHAINS } from '@/lib/crypto/utxo';
@@ -8,7 +8,9 @@ import { prepareEvmSend, sendEvm, waitForEvm, type EvmSendQuote } from '@/lib/ch
 import { buildUtxoTx, deriveUtxoSigner, type UtxoSendPlan } from '@/lib/chains/utxoSend';
 import { broadcastUtxoTx, fetchPrevTxHex, fetchUtxoFeeRate, fetchUtxos } from '@/lib/api/external';
 import { formatAmount, formatUnits, parseUnits, shortAddress, toNumber } from '@/lib/format';
+import { useExternalPrices } from '@/hooks/useExternalChain';
 import { useActiveAccount, useWallet } from '@/state/wallet';
+import { QrScanner } from './QrScanner';
 import { Badge, Button, Card, cn, Input, Notice, Row } from '../ui/primitives';
 import { TokenIcon } from '../ui/TokenIcon';
 
@@ -27,8 +29,12 @@ export function ExternalSend({ chain, address }: { chain: ExternalChain; address
   const account = useActiveAccount()!;
   const getMnemonic = useWallet((s) => s.getMnemonicForAccount);
   const qc = useQueryClient();
+  const prices = useExternalPrices();
+  const price = prices.data?.[chain.coingeckoId];
   const [recipient, setRecipient] = useState('');
   const [amountStr, setAmountStr] = useState('');
+  const [usdMode, setUsdMode] = useState(false);
+  const [scanOpen, setScanOpen] = useState(false);
   const [phase, setPhase] = useState<Phase>('form');
   const [preparing, setPreparing] = useState(false);
   const [prepared, setPrepared] = useState<Prepared | null>(null);
@@ -37,9 +43,12 @@ export function ExternalSend({ chain, address }: { chain: ExternalChain; address
   const [txid, setTxid] = useState<string>();
 
   const addrOk = recipient ? chain.isValidAddress(recipient.trim()) : null;
-  const amount = parseUnits(amountStr, chain.decimals);
-  const amountErr = amountStr && amount == null ? 'Invalid amount' : undefined;
+  // In USD mode the field is a dollar amount; convert to the coin amount using its price.
+  const cryptoStr = usdMode ? (price && Number(amountStr) > 0 ? (Number(amountStr) / price).toFixed(Math.min(chain.decimals, 8)) : '') : amountStr;
+  const amount = parseUnits(cryptoStr, chain.decimals);
+  const amountErr = amountStr && amount == null ? 'Invalid amount' : usdMode && !price ? 'Price unavailable — switch to ' + chain.symbol : undefined;
   const canReview = addrOk && amount != null && amount > 0n && !preparing;
+  const equiv = usdMode ? (amount != null ? `${formatAmount(toNumber(amount, chain.decimals))} ${chain.symbol}` : '') : price && Number(amountStr) > 0 ? `≈ $${(Number(amountStr) * price).toFixed(2)}` : '';
 
   const reset = () => {
     setPhase('form');
@@ -184,13 +193,45 @@ export function ExternalSend({ chain, address }: { chain: ExternalChain; address
 
   return (
     <div className="space-y-4">
-      <Input label={`Recipient ${chain.name} address`} value={recipient} onChange={(e) => setRecipient(e.target.value.trim())} placeholder={chain.kind === 'evm' ? '0x…' : `${chain.symbol} address`} className="font-mono text-sm" error={recipient && addrOk === false ? `Not a valid ${chain.name} address` : undefined} data-testid="ext-recipient" />
-      <Input label="Amount" inputMode="decimal" value={amountStr} onChange={(e) => setAmountStr(e.target.value.replace(/[^\d.]/g, ''))} placeholder="0.00" className="num" error={amountErr} right={<span className="pr-1 text-sm font-semibold text-mist-400">{chain.symbol}</span>} data-testid="ext-amount" />
+      <Input
+        label={`Recipient ${chain.name} address`}
+        value={recipient}
+        onChange={(e) => setRecipient(e.target.value.trim())}
+        placeholder={chain.kind === 'evm' ? '0x…' : `${chain.symbol} address`}
+        className="font-mono text-sm"
+        error={recipient && addrOk === false ? `Not a valid ${chain.name} address` : undefined}
+        data-testid="ext-recipient"
+        right={
+          <button type="button" onClick={() => setScanOpen(true)} className="rounded-lg p-2 text-mist-400 hover:text-mist-100" aria-label="Scan QR code">
+            <QrCode className="h-4 w-4" />
+          </button>
+        }
+      />
+      <div>
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-sm font-medium text-mist-300">Amount</span>
+          <button type="button" onClick={() => { setUsdMode((v) => !v); setAmountStr(''); }} disabled={!price} className="rounded-lg bg-white/[0.06] px-2 py-1 text-xs font-semibold text-accent hover:bg-white/[0.1] disabled:opacity-40">
+            {usdMode ? `Switch to ${chain.symbol}` : 'Switch to USD'}
+          </button>
+        </div>
+        <Input
+          inputMode="decimal"
+          value={amountStr}
+          onChange={(e) => setAmountStr(e.target.value.replace(/[^\d.]/g, ''))}
+          placeholder="0.00"
+          className="num text-lg"
+          error={amountErr}
+          hint={equiv}
+          right={<span className="pr-1 text-sm font-semibold text-mist-400">{usdMode ? 'USD' : chain.symbol}</span>}
+          data-testid="ext-amount"
+        />
+      </div>
       {error && <Notice tone="danger" title="Error">{error}</Notice>}
       <Notice>Fees use the cheapest reliable rate for {chain.name}. Sends from {shortAddress(address, 6)}.</Notice>
       <Button variant="primary" size="lg" block disabled={!canReview} loading={preparing} onClick={review} data-testid="ext-review">
         {preparing ? 'Preparing…' : 'Review send'}
       </Button>
+      <QrScanner open={scanOpen} onOpenChange={setScanOpen} onScan={(addr) => setRecipient(addr)} />
     </div>
   );
 }

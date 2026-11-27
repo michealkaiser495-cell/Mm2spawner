@@ -235,14 +235,19 @@ function Holdings() {
   const { config } = useNetwork();
   const ext = useExternalAssets();
   const [q, setQ] = useState('');
-  const list = useMemo(() => {
+  // One combined list, sorted so the asset you hold the most value in is at the top.
+  const rows = useMemo(() => {
     const s = q.trim().toLowerCase();
-    return s ? p.assets.filter((a) => a.symbol.toLowerCase().includes(s) || a.name.toLowerCase().includes(s) || a.mint.toLowerCase() === s) : p.assets;
-  }, [p.assets, q]);
-  const extList = useMemo(() => {
-    const s = q.trim().toLowerCase();
-    return s ? ext.assets.filter((a) => a.chain.symbol.toLowerCase().includes(s) || a.chain.name.toLowerCase().includes(s)) : ext.assets;
-  }, [ext.assets, q]);
+    type Row = { key: string; v: number } & ({ kind: 'sol'; a: Asset } | { kind: 'ext'; a: import('@/hooks/useExternalChain').ExternalAsset });
+    const sol: Row[] = p.assets
+      .filter((a) => !s || a.symbol.toLowerCase().includes(s) || a.name.toLowerCase().includes(s) || a.mint.toLowerCase() === s)
+      .map((a) => ({ kind: 'sol', a, key: 'sol:' + a.key, v: a.valueUsd ?? -1 }));
+    const external: Row[] = ext.assets
+      .filter((a) => !s || a.chain.symbol.toLowerCase().includes(s) || a.chain.name.toLowerCase().includes(s))
+      .map((a) => ({ kind: 'ext', a, key: 'ext:' + a.chain.id, v: a.valueUsd ?? -1 }));
+    // Sort by USD value desc; ties keep SOL/native first, then registry order.
+    return [...sol, ...external].sort((x, y) => y.v - x.v);
+  }, [p.assets, ext.assets, q]);
 
   return (
     <Card className="p-3 sm:p-4">
@@ -271,22 +276,11 @@ function Holdings() {
             </div>
           ))}
         </div>
+      ) : rows.length === 0 ? (
+        <EmptyState icon={<Wallet className="h-6 w-6" />} title={q ? 'No matching assets' : 'No assets yet'} body={q ? 'Try a different search.' : 'Receive crypto to get started.'} />
       ) : (
         <div>
-          {list.map((a) => (
-            <TokenRow key={a.key} a={a} />
-          ))}
-          {extList.length > 0 && (
-            <>
-              {!q && <p className="px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wider text-mist-400">Other networks</p>}
-              {extList.map((a) => (
-                <ExternalAssetRow key={a.chain.id} a={a} />
-              ))}
-            </>
-          )}
-          {list.length === 0 && extList.length === 0 && (
-            <EmptyState icon={<Wallet className="h-6 w-6" />} title={q ? 'No matching assets' : 'No assets yet'} body={q ? 'Try a different search.' : 'Receive crypto to get started.'} />
-          )}
+          {rows.map((r) => (r.kind === 'sol' ? <TokenRow key={r.key} a={r.a} /> : <ExternalAssetRow key={r.key} a={r.a} />))}
         </div>
       )}
       {p.assets.some((a) => !a.verified) && (

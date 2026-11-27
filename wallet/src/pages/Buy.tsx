@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { CrossmintProvider, CrossmintHostedCheckout } from '@crossmint/client-sdk-react-ui';
-import { ArrowDownLeft, CreditCard, Droplets, ExternalLink, Settings2, ShieldCheck } from 'lucide-react';
+import { ArrowDownLeft, CreditCard, ExternalLink, ShieldCheck } from 'lucide-react';
 import { CROSSMINT_MAX_USD, CROSSMINT_MIN_USD, crossmintDeliversTo, crossmintEnv, DEFAULT_CROSSMINT_CLIENT_KEY, USDC_MINT_MAINNET, usdcTokenLocator } from '@/lib/crossmint';
 import { NATIVE_MINT } from '@/lib/solana/balances';
 import { NETWORKS } from '@/lib/solana/networks';
@@ -30,13 +30,17 @@ function BuyWithCrossmint({ clientKey }: { clientKey: string }) {
   const receiptEmail = useSettings((s) => s.receiptEmail);
   const { config } = useNetwork();
   const portfolio = usePortfolio();
+  const update = useSettings((s) => s.update);
   const [amount, setAmount] = useState('50');
+  const [email, setEmail] = useState(receiptEmail);
   const [token, setToken] = useState<PickableToken>(USDC);
   const [pickerOpen, setPickerOpen] = useState(false);
   const env = crossmintEnv(clientKey);
   const deliversTo = crossmintDeliversTo(clientKey);
   const n = Number(amount);
-  const valid = Number.isFinite(n) && n >= CROSSMINT_MIN_USD && n <= CROSSMINT_MAX_USD;
+  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+  const amountOk = Number.isFinite(n) && n >= CROSSMINT_MIN_USD && n <= CROSSMINT_MAX_USD;
+  const valid = amountOk && emailOk;
   const networkMismatch = config.id !== deliversTo;
 
   const isUsdc = token.mint === USDC_MINT_MAINNET || token.symbol === 'USDC';
@@ -87,7 +91,23 @@ function BuyWithCrossmint({ clientKey }: { clientKey: string }) {
               </button>
             ))}
           </div>
-          <p className="mt-2 text-xs text-mist-400">You pay ${valid ? n.toFixed(2) : '0.00'} and receive {token.symbol} at the market rate (minus Crossmint’s fee, shown at checkout). Limit ${CROSSMINT_MAX_USD}/order without extra verification.</p>
+          <p className="mt-2 text-xs text-mist-400">You pay ${amountOk ? n.toFixed(2) : '0.00'} and receive {token.symbol} at the market rate (minus Crossmint’s fee, shown at checkout). Limit ${CROSSMINT_MAX_USD}/order without extra verification.</p>
+        </div>
+
+        <div className="mt-4">
+          <Input
+            label="Email (required)"
+            type="email"
+            inputMode="email"
+            value={email}
+            onChange={(e) => {
+              setEmail(e.target.value.trim());
+              update({ receiptEmail: e.target.value.trim() });
+            }}
+            placeholder="you@example.com"
+            error={email && !emailOk ? 'Enter a valid email' : undefined}
+            hint="Crossmint sends your receipt and purchase updates here. Required to check out."
+          />
         </div>
 
         <div className="mt-4 rounded-2xl border border-white/[0.06] bg-white/[0.02] p-3 text-sm">
@@ -117,15 +137,15 @@ function BuyWithCrossmint({ clientKey }: { clientKey: string }) {
                 className="accent-gradient inline-flex h-13 w-full items-center justify-center gap-2 rounded-2xl text-base font-semibold text-ink-950 transition-all hover:brightness-110"
                 recipient={{ walletAddress: account.publicKey }}
                 lineItems={{ tokenLocator, executionParameters: { mode: 'exact-in', amount: String(n) } }}
-                payment={{ fiat: { enabled: true }, crypto: { enabled: false }, defaultMethod: 'fiat', ...(receiptEmail ? { receiptEmail } : {}) }}
+                payment={{ fiat: { enabled: true }, crypto: { enabled: false }, defaultMethod: 'fiat', receiptEmail: email.trim() }}
                 appearance={{ display: 'popup' }}
               >
-                <CreditCard className="h-5 w-5" /> Buy ${valid ? n : 0} of {token.symbol}
+                <CreditCard className="h-5 w-5" /> Buy ${n} of {token.symbol}
               </CrossmintHostedCheckout>
             </CrossmintProvider>
           ) : (
             <Button variant="primary" size="lg" block disabled>
-              {stagingNonUsdc ? 'Switch to USDC for test mode' : n > CROSSMINT_MAX_USD ? `Max $${CROSSMINT_MAX_USD} per order` : `Enter at least $${CROSSMINT_MIN_USD}`}
+              {stagingNonUsdc ? 'Switch to USDC for test mode' : !amountOk ? (n > CROSSMINT_MAX_USD ? `Max $${CROSSMINT_MAX_USD} per order` : `Enter at least $${CROSSMINT_MIN_USD}`) : 'Enter your email to continue'}
             </Button>
           )}
         </div>
@@ -146,47 +166,15 @@ function BuyWithCrossmint({ clientKey }: { clientKey: string }) {
   );
 }
 
-function CrossmintSetup() {
-  const navigate = useNavigate();
-  return (
-    <Card className="p-6">
-      <span className="mx-auto grid h-16 w-16 place-items-center rounded-3xl bg-white/[0.05]">
-        <CreditCard className="h-7 w-7 text-accent" />
-      </span>
-      <h2 className="mt-4 text-center font-display text-xl font-bold">Set up card purchases</h2>
-      <p className="mx-auto mt-2 max-w-sm text-center text-sm text-mist-400">
-        Buying with a card is powered by <strong>Crossmint</strong>. Add your Crossmint <strong>client key</strong> (<span className="font-mono">ck_…</span>) to enable it. It stays on this device.
-      </p>
-      <ol className="mx-auto mt-5 max-w-sm space-y-2 text-sm text-mist-300">
-        <li>1. Create a free account at <a href="https://crossmint.com" target="_blank" rel="noopener noreferrer" className="text-accent hover:underline">crossmint.com</a>.</li>
-        <li>2. Make a <strong>client</strong> API key with the <span className="font-mono text-xs">orders.create</span> scope.</li>
-        <li>3. Add your app’s URL as an allowed origin.</li>
-        <li>4. Paste the <span className="font-mono">ck_…</span> key in Settings.</li>
-      </ol>
-      <Button variant="primary" block className="mt-6" onClick={() => navigate('/settings/buy')}>
-        <Settings2 className="h-4 w-4" /> Add Crossmint key
-      </Button>
-      <Notice tone="warn" className="mt-4">Never paste a secret key (<span className="font-mono">sk_…</span>) into any app. Only the client key (<span className="font-mono">ck_…</span>) belongs in a wallet.</Notice>
-    </Card>
-  );
-}
-
 export function Buy() {
-  const navigate = useNavigate();
-  const { config } = useNetwork();
-  // Use the user's own key if set, otherwise the built-in (origin-restricted) client key.
-  const clientKey = useSettings((s) => s.crossmintClientKey) || DEFAULT_CROSSMINT_CLIENT_KEY;
+  // The built-in, origin-restricted client key is always used — no setup needed.
+  const clientKey = DEFAULT_CROSSMINT_CLIENT_KEY;
 
   return (
     <div className="mx-auto max-w-lg">
-      <PageHeader title="Buy crypto" back="/" action={clientKey ? <Button size="sm" variant="ghost" onClick={() => navigate('/settings/buy')}><Settings2 className="h-4 w-4" /></Button> : undefined} />
-      {clientKey ? <BuyWithCrossmint clientKey={clientKey} /> : <CrossmintSetup />}
-      <div className="mt-4 space-y-2">
-        {config.isTestnet && (
-          <Button block onClick={() => navigate('/')}>
-            <Droplets className="h-4 w-4" /> Or get free test SOL from the faucet
-          </Button>
-        )}
+      <PageHeader title="Buy crypto" back="/" />
+      <BuyWithCrossmint clientKey={clientKey} />
+      <div className="mt-4">
         <Link to="/receive" className="flex h-11 items-center justify-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.06] text-sm font-medium hover:bg-white/[0.1]">
           <ArrowDownLeft className="h-4 w-4" /> Or receive from an exchange
         </Link>
