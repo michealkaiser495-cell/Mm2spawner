@@ -22,7 +22,7 @@ const CSP = [
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",
-  "frame-src 'none'",
+  "frame-src 'self' https://*.crossmint.com https://crossmint.com",
   "worker-src 'self' blob:",
 ].join('; ');
 

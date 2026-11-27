@@ -115,7 +115,7 @@ for (const [name, re] of externals) {
 await page.getByRole('button', { name: /^Litecoin/ }).click();
 await page.waitForTimeout(1200);
 await shot('06b-receive-ltc');
-await visit('/buy', '07-buy', 'Not yet implemented');
+await visit('/buy', '07-buy', 'Set up card purchases');
 await visit('/send', '08-send', 'Send');
 
 // Send flow validation (no funds needed for validation)

@@ -32,6 +32,10 @@ export interface Settings {
   slippageBps: number;
   feeLevel: 'eco' | 'normal' | 'turbo';
   clipboardClearSeconds: number;
+  /** Crossmint CLIENT key (ck_…) for the Buy flow. Browser-safe, origin-restricted, stored only on this device. */
+  crossmintClientKey: string;
+  /** Optional email for Crossmint purchase receipts. */
+  receiptEmail: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -52,6 +56,8 @@ export const DEFAULT_SETTINGS: Settings = {
   slippageBps: 50,
   feeLevel: 'eco', // cheapest priority fee by default
   clipboardClearSeconds: 60,
+  crossmintClientKey: '',
+  receiptEmail: '',
 };
 
 interface SettingsStore extends Settings {
@@ -83,6 +89,8 @@ function sanitize(p: Partial<Settings> | undefined): Partial<Settings> {
   if (typeof out.autoLockMinutes !== 'number' || out.autoLockMinutes < 1 || out.autoLockMinutes > 240) delete out.autoLockMinutes;
   if (typeof out.slippageBps !== 'number' || out.slippageBps < 1 || out.slippageBps > 5000) delete out.slippageBps;
   if (!['eco', 'normal', 'turbo'].includes(out.feeLevel as string)) delete out.feeLevel;
+  // Never persist a secret key by mistake: only client keys (ck_) are allowed.
+  if (typeof out.crossmintClientKey !== 'string' || (out.crossmintClientKey && !out.crossmintClientKey.startsWith('ck_'))) delete out.crossmintClientKey;
   return out;
 }
 

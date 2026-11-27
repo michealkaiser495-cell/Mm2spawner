@@ -10,6 +10,7 @@ import { ACCENTS, useSettings, type AccentId } from '@/state/settings';
 import { useWallet } from '@/state/wallet';
 import { Badge, Button, cn, Input, Notice, Segmented, Switch } from '@/components/ui/primitives';
 import { Modal } from '@/components/ui/Modal';
+import { crossmintEnv, isValidClientKey } from '@/lib/crossmint';
 import { NetworkDot, useSwitchNetwork } from '@/components/wallet/NetworkSelector';
 import { SettingRow, SettingsCard } from './parts';
 
@@ -281,6 +282,72 @@ export function AboutSection() {
           </Button>
         </div>
       </Modal>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ buy (Crossmint)
+
+export function BuySection() {
+  const clientKey = useSettings((s) => s.crossmintClientKey);
+  const receiptEmail = useSettings((s) => s.receiptEmail);
+  const update = useSettings((s) => s.update);
+  const [key, setKey] = useState(clientKey);
+  const [email, setEmail] = useState(receiptEmail);
+  const isSecret = key.trim().startsWith('sk_');
+  const validClient = isValidClientKey(key.trim());
+  const env = validClient ? crossmintEnv(key.trim()) : null;
+
+  return (
+    <div className="space-y-5">
+      <SettingsCard title="Buy with card (Crossmint)" desc="Buying crypto with a card or Apple Pay is powered by Crossmint. Paste your Crossmint client key below — it is stored only on this device and never sent to Nocta.">
+        <div className="py-3">
+          <Input
+            label="Crossmint client key"
+            placeholder="ck_staging_… or ck_production_…"
+            value={key}
+            onChange={(e) => setKey(e.target.value.trim())}
+            className="font-mono text-xs"
+            error={key && isSecret ? 'That is a SECRET key. Never use sk_ keys in an app — use a client (ck_) key.' : key && !validClient ? 'Must be a Crossmint client key starting with ck_' : undefined}
+            hint={validClient ? `Valid ${env} client key` : 'Create one at crossmint.com with the orders.create scope and your app origin.'}
+          />
+          <Input label="Receipt email (optional)" type="email" value={email} onChange={(e) => setEmail(e.target.value.trim())} placeholder="you@example.com" className="mt-3" hint="Crossmint sends purchase receipts here." />
+          <div className="mt-3 flex gap-2">
+            <Button
+              variant="primary"
+              disabled={(!!key && !validClient) || (key === clientKey && email === receiptEmail)}
+              onClick={() => {
+                update({ crossmintClientKey: validClient ? key.trim() : '', receiptEmail: email.trim() });
+                toast.success(validClient ? 'Crossmint key saved' : 'Crossmint key cleared');
+              }}
+            >
+              Save
+            </Button>
+            {clientKey && (
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setKey('');
+                  update({ crossmintClientKey: '' });
+                  toast.success('Crossmint key removed');
+                }}
+              >
+                Remove key
+              </Button>
+            )}
+          </div>
+        </div>
+      </SettingsCard>
+      <Notice tone={isSecret ? 'danger' : 'info'} title={isSecret ? 'Do not use a secret key' : 'Which key?'}>
+        Use the <span className="font-mono">ck_</span> <strong>client</strong> key (browser-safe, origin-restricted). Never paste an <span className="font-mono">sk_</span> secret key into any app — anyone could extract it and charge money.
+      </Notice>
+      <SettingsCard title="How Buy works">
+        <div className="space-y-2 py-4 text-sm text-mist-300">
+          <p>Card payments open <strong>Crossmint’s</strong> secure checkout (where Apple Pay appears). Nocta never sees your card details.</p>
+          <p>Crossmint delivers <strong>USDC</strong> to your Solana address — on mainnet for a production key, on devnet for a staging (test) key.</p>
+          <p>A <span className="font-mono">ck_staging_</span> key lets you test with card <span className="font-mono">4242 4242 4242 4242</span> and no real money.</p>
+        </div>
+      </SettingsCard>
     </div>
   );
 }

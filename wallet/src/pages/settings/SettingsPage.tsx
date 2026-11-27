@@ -1,16 +1,17 @@
 import { NavLink, useParams } from 'react-router-dom';
-import { ChevronRight, Globe, Info, KeyRound, Lock, Palette, ShieldCheck, Users, EyeOff } from 'lucide-react';
+import { ChevronRight, CreditCard, Globe, Info, KeyRound, Lock, Palette, ShieldCheck, Users, EyeOff } from 'lucide-react';
 import { PageHeader } from '@/components/layout/AppShell';
 import { Card, cn } from '@/components/ui/primitives';
 import { WalletsSection } from './WalletsSection';
 import { BackupSection, SecuritySection } from './SecuritySection';
-import { AboutSection, DisplaySection, NetworkSection, PrivacySection } from './PreferenceSections';
+import { AboutSection, BuySection, DisplaySection, NetworkSection, PrivacySection } from './PreferenceSections';
 
 const SECTIONS = [
   { id: 'wallets', label: 'Wallets & accounts', desc: 'Create, import, rename, switch', icon: Users, el: <WalletsSection /> },
   { id: 'security', label: 'Security', desc: 'Password, auto-lock, signing', icon: Lock, el: <SecuritySection /> },
   { id: 'backup', label: 'Recovery & backup', desc: 'Recovery phrase, private keys', icon: KeyRound, el: <BackupSection /> },
   { id: 'network', label: 'Network', desc: 'Cluster & RPC endpoints', icon: Globe, el: <NetworkSection /> },
+  { id: 'buy', label: 'Buy with card', desc: 'Crossmint on-ramp key', icon: CreditCard, el: <BuySection /> },
   { id: 'display', label: 'Display', desc: 'Currency, theme, motion', icon: Palette, el: <DisplaySection /> },
   { id: 'privacy', label: 'Privacy', desc: 'Balances, data sources', icon: EyeOff, el: <PrivacySection /> },
   { id: 'about', label: 'About', desc: 'Version, security model', icon: Info, el: <AboutSection /> },
